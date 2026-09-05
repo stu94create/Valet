@@ -3,7 +3,7 @@
 // Add to Siri from the script's settings so "Hey Siri, <name>" opens him.
 // Optional: add a Scriptable widget and choose this script for a standing brief.
 
-const VERSION = "4.3";
+const VERSION = "4.4";
 
 // ───────────────────────── Phrase book ─────────────────────────
 const P = {
@@ -2067,15 +2067,50 @@ function nextRedraw(today, tom, due) {
 }
 function lookedAt() { const d = new Date(); return `Looked at ${pad(d.getHours())}:${pad(d.getMinutes())}.`; }
 
+// ───────────────────────── The look ─────────────────────────
+// A dark card that reads like a letter, not a notification. Monochrome:
+// near-black, three weights of warm white, and one thread of brass on the
+// rule and the signature and nowhere else. Nothing louder than the paragraph.
+const LOOK = {
+  bgFrom: "#0B0B0C", bgTo: "#111112", bgLift: "#151310",      // top-left to bottom-right, a warm lift in the last corner
+  ink: "#F2EEE6", muted: "#8A8781", brass: "#B8925A",
+  serif: "IowanOldStyle-Roman", serifItalic: "IowanOldStyle-Italic", // the PostScript names iOS answers to
+  pad: { top: 16, left: 16, bottom: 14, right: 16 }
+};
+const ink = () => new Color(LOOK.ink), muted = () => new Color(LOOK.muted), brass = a => new Color(LOOK.brass, a == null ? 1 : a);
+function paintCard(w) {
+  const g = new LinearGradient();
+  g.colors = [new Color(LOOK.bgFrom), new Color(LOOK.bgTo), new Color(LOOK.bgLift)];
+  g.locations = [0, 0.82, 1];
+  g.startPoint = new Point(0, 0); g.endPoint = new Point(1, 1);
+  w.backgroundGradient = g;
+  w.setPadding(LOOK.pad.top, LOOK.pad.left, LOOK.pad.bottom, LOOK.pad.right);
+}
+// UIKit gives the system face if a named one is missing, silently; there is
+// no way to ask. Iowan Old Style ships with iOS, so this should hold.
+const serif = (size, italic) => new Font(italic ? LOOK.serifItalic : LOOK.serif, size);
+const smallCaps = s => String(s).toUpperCase().split("").join(" ");   // letter-spaced by hand; widgets have no tracking
+// The glanceable line: figures and short forms only, never the paragraph's words.
+function statusStrip(wx, due, today, tom) {
+  const bits = [];
+  if (wx && wx.now != null) bits.push(`${wx.now}°${wx.word ? " " + wx.word : ""}`);
+  if (wx && wx.rain != null && wx.rain >= 40) bits.push(`rain ${wx.rain}%`);
+  bits.push(due.length ? `${due.length} outstanding` : "nothing outstanding");
+  const next = leadOrder(today).find(e => !e.isAllDay && e.startDate > new Date());
+  if (next) bits.push(`${tidy(next.title)} ${niceTime(next.startDate).replace(/ in the (morning|afternoon|evening)/, "")}`);
+  else { const t = (tom || []).filter(e => !continuing(e))[0]; if (t) bits.push(`${tidy(t.title)} tomorrow`); }
+  return bits.join(" · ");
+}
+
 async function widget() {
   const size = config.widgetFamily || "medium";
   const w = new ListWidget();
-  w.setPadding(16, 16, 14, 16);
+  paintCard(w);
   w.url = "scriptable:///run/" + encodeURIComponent(Script.name());
 
   if (!S.introduced) {
     const t = w.addText("Tap to be introduced.");
-    t.font = Font.italicSystemFont(15);
+    t.font = serif(15, true); t.textColor = ink();
     Script.setWidget(w); return;
   }
 
@@ -2143,26 +2178,47 @@ async function widget() {
   delete latest.briefPart; delete latest.headline; delete latest.headlineAt;
   writeCache(latest);
 
-  const body = w.addText(text);
-  body.font = Font.systemFont(size === "small" ? 13 : size === "large" ? 17 : 15);
-  body.minimumScaleFactor = 0.7;
-  body.lineLimit = size === "small" ? 6 : size === "large" ? 14 : 6;
+  // ── The card, top to bottom ──
+  // 1. Header: his name in small capitals, then the date. Muted.
+  const df = new DateFormatter(); df.dateFormat = "EEEE d MMMM";
+  const head = w.addText(size === "small" ? smallCaps(S.valet) : `${smallCaps(S.valet)} · ${smallCaps(df.string(new Date()))}`);
+  head.font = Font.mediumSystemFont(11); head.textColor = muted(); head.lineLimit = 1;
 
+  if (size !== "small") {
+    // 2. Status strip: the glanceable layer, figures and short forms.
+    const strip = statusStrip(wx, due, today, tom);
+    if (strip) { w.addSpacer(3); const st = w.addText(strip); st.font = Font.regularSystemFont(11); st.textColor = muted(); st.lineLimit = 1; st.minimumScaleFactor = 0.85; }
+    // 3. A hairline in brass, a quarter strength.
+    w.addSpacer(8);
+    const rule = w.addStack(); rule.size = new Size(0, 1); rule.backgroundColor = brass(0.25);
+    w.addSpacer(8);
+  } else {
+    w.addSpacer(6);
+  }
+
+  // 4. The paragraph, ivory serif. Truncate before shrinking.
+  const body = w.addText(text);
+  body.font = serif(size === "small" ? 13 : size === "large" ? 17 : 15);
+  body.textColor = ink();
+  body.minimumScaleFactor = 0.8;
+  body.lineLimit = size === "small" ? 5 : size === "large" ? 12 : 5;
+
+  // 5. Whatever the length, the footer sits at the foot.
   w.addSpacer();
-  const foot = w.addStack(); foot.centerAlignContent();
-  const s = foot.addText("— " + S.valet);
-  s.font = Font.italicSystemFont(11); s.textOpacity = 0.45;
+
+  // 6. Footer: signature in brass italic, "Looked at" beneath on the large
+  //    card, and the Read-aloud pill on its own tap target.
+  const foot = w.addStack(); foot.layoutHorizontally(); foot.bottomAlignContent();
+  const left = foot.addStack(); left.layoutVertically();
+  const signature = left.addText("— " + S.valet); signature.font = serif(12, true); signature.textColor = brass();
+  if (size === "large") { const looked = left.addText(lookedAt()); looked.font = Font.regularSystemFont(10); looked.textColor = muted(); looked.textOpacity = 0.6; }
   if (size !== "small") {
     foot.addSpacer();
-    // Its own tap target: opens him and he reads this aloud, nothing else.
-    const readStack = foot.addStack();
-    readStack.url = "scriptable:///run/" + encodeURIComponent(Script.name()) + "?read=1";
-    const r = readStack.addText("Read aloud");
-    r.font = Font.mediumSystemFont(11); r.textOpacity = 0.7;
+    const pill = foot.addStack();
+    pill.url = "scriptable:///run/" + encodeURIComponent(Script.name()) + "?read=1";   // opens him and he reads this aloud, nothing else
+    pill.setPadding(4, 10, 4, 10); pill.cornerRadius = 11; pill.borderWidth = 1; pill.borderColor = new Color(LOOK.muted, 0.4);
+    const r = pill.addText("Read aloud"); r.font = Font.mediumSystemFont(11); r.textColor = ink();
   }
-  // So a stale widget looks stale. Not part of what he reads aloud.
-  const looked = w.addText(lookedAt());
-  looked.font = Font.systemFont(10); looked.textOpacity = 0.35;
 
   w.refreshAfterDate = nextRedraw(today, tom, due);
   Script.setWidget(w);
