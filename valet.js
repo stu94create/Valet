@@ -2090,6 +2090,9 @@ function paintCard(w) {
 // no way to ask. Iowan Old Style ships with iOS, so this should hold.
 const serif = (size, italic) => new Font(italic ? LOOK.serifItalic : LOOK.serif, size);
 const smallCaps = s => String(s).toUpperCase();   // capitals only: spacing the letters by hand made VoiceOver spell them out
+// Spelt out from the device clock, not a formatter, so the day is the telephone's own.
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 // The glanceable line: figures and short forms only, never the paragraph's words.
 function statusStrip(wx, due, today, tom) {
   const bits = [];
@@ -2179,18 +2182,21 @@ async function widget() {
   writeCache(latest);
 
   // ── The card, top to bottom ──
-  // 1. Header: his name in small capitals, then the date. Muted.
-  const df = new DateFormatter(); df.dateFormat = "EEEE d MMMM";
-  const head = w.addText(size === "small" ? smallCaps(S.valet) : `${smallCaps(S.valet)} · ${smallCaps(df.string(new Date()))}`);
-  head.font = Font.mediumSystemFont(11); head.textColor = muted(); head.lineLimit = 1;
+  // Each line of the top matter is its own row of fixed height, so nothing
+  // can be squeezed onto its neighbour when the paragraph runs long.
+  const line = (h, fill) => { const s = w.addStack(); s.layoutHorizontally(); s.centerAlignContent(); s.size = new Size(0, h); fill(s); s.addSpacer(); return s; };
+  // 1. Header: his name in capitals, then today's date from the device clock. Muted.
+  const now = new Date();
+  const dateWords = `${DAY_NAMES[now.getDay()]} ${now.getDate()} ${MONTH_NAMES[now.getMonth()]}`;
+  line(14, s => { const head = s.addText(size === "small" ? smallCaps(S.valet) : `${smallCaps(S.valet)} · ${smallCaps(dateWords)}`); head.font = Font.mediumSystemFont(11); head.textColor = muted(); head.lineLimit = 1; });
 
   if (size !== "small") {
-    // 2. Status strip: the glanceable layer, figures and short forms.
+    // 2. Status strip, on its own row beneath: the glanceable layer, figures and short forms.
     const strip = statusStrip(wx, due, today, tom);
-    if (strip) { w.addSpacer(3); const st = w.addText(strip); st.font = Font.regularSystemFont(11); st.textColor = muted(); st.lineLimit = 1; st.minimumScaleFactor = 0.85; }
-    // 3. A hairline in brass, a quarter strength.
+    if (strip) { w.addSpacer(4); line(14, s => { const st = s.addText(strip); st.font = Font.regularSystemFont(11); st.textColor = muted(); st.lineLimit = 1; st.minimumScaleFactor = 0.85; }); }
+    // 3. A hairline in brass, a quarter strength: a full-width row one point tall.
     w.addSpacer(8);
-    const rule = w.addStack(); rule.size = new Size(0, 1); rule.backgroundColor = brass(0.25);
+    line(1, s => { s.backgroundColor = brass(0.25); s.cornerRadius = 0.5; });
     w.addSpacer(8);
   } else {
     w.addSpacer(6);
