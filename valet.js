@@ -2200,8 +2200,17 @@ async function widget() {
   const body = w.addText(text);
   body.font = serif(size === "small" ? 13 : size === "large" ? 17 : 15);
   body.textColor = ink();
-  body.minimumScaleFactor = 0.8;
-  body.lineLimit = size === "small" ? 5 : size === "large" ? 12 : 5;
+  if (size === "large") {
+    // No fixed line count: the paragraph fills the card and the spacer below
+    // pins the footer. The scale factor absorbs the occasional long brief; the
+    // text is cut at a sentence end before it could ever be cut mid-word.
+    body.minimumScaleFactor = 0.75;
+    body.lineLimit = 0;
+    if (text.length > 650) { const cut = text.lastIndexOf(". ", 650); if (cut > 200) body.text = text.slice(0, cut + 1); }
+  } else {
+    body.minimumScaleFactor = 0.8;
+    body.lineLimit = 5;
+  }
 
   // 5. Whatever the length, the footer sits at the foot.
   w.addSpacer();
