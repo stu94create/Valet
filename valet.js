@@ -3,7 +3,7 @@
 // Add to Siri from the script's settings so "Hey Siri, <name>" opens him.
 // Optional: add a Scriptable widget and choose this script for a standing brief.
 
-const VERSION = "3.2";
+const VERSION = "4.0";
 
 // ───────────────────────── Phrase book ─────────────────────────
 const P = {
@@ -51,7 +51,15 @@ const P = {
   anythingElse: "Anything else?",
   thatWillBeAll: "Very good.",
   cantRecall: "I've no note of that.",
-  papersLater: "I'll not repeat myself; you had the papers this morning."
+  papersLater: "I'll not repeat myself; you had the papers this morning.",
+  householdAsk: "Anything I should know about the household? You can tell me later, below stairs.",
+  householdNoted: "Noted. I shan't mention it at parties.",
+  usual: a => `You normally have ${a} about now. Shall I fetch it?`,
+  detailsBelow: "The particulars are below stairs, under what went wrong.",
+  voiceGone: "My voice has deserted me. The telephone's own will have to do.",
+  nothingWrong: "Nothing has gone wrong. I've made a note of the date.",
+  changesIntro: "This edition, in brief.",
+  quietArranged: "Quiet hours arranged. I shall hold my tongue."
 };
 
 const DUTIES = [
@@ -81,7 +89,7 @@ const DEFAULT_APPS = [
 
 // The papers he takes by default. Any RSS or Atom feed will do; edit or add
 // below stairs, or import an OPML file from Lire, Overcast and the like.
-// "tag" marks feeds worth flagging for the podcast when he writes the brief.
+// "tag" marks feeds he should flag for your attention when he writes the brief.
 const DEFAULT_FEEDS = [
   { n: "RTÉ News", u: "https://www.rte.ie/news/rss/news-headlines.xml" },
   { n: "The Irish Times", u: "https://www.irishtimes.com/arc/outboundfeeds/rss/" },
@@ -105,14 +113,47 @@ function load() {
   try {
     if (fm.fileExists(statePath)) { fm.downloadFileFromiCloud(statePath); return JSON.parse(fm.readString(statePath)); }
   } catch (e) {}
-  return { introduced: false, valet: "", address: "sir", name: "", custom: "", apps: DEFAULT_APPS.slice(), feeds: DEFAULT_FEEDS.slice(), routine: {}, speak: true, model: "gemini-2.5-flash",
-           notices: { brief: 8, news: 0, half: true } }; // hours in 24h clock; 0 = off
+  return { introduced: false, valet: "", address: "sir", name: "", custom: "", apps: DEFAULT_APPS.slice(), feeds: DEFAULT_FEEDS.slice(), routine: {}, habits: [], speak: true, model: "gemini-2.5-flash",
+           notices: { brief: 8, news: 0, half: true }, // hours in 24h clock; 0 = off
+           profile: { where: "", does: "", papers: "", other: "" }, quiet: { from: 0, to: 0 }, symbols: true };
 }
 function save() { fm.writeString(statePath, JSON.stringify(S)); }
 // Older saves may lack newer fields.
 S.feeds = S.feeds || DEFAULT_FEEDS.slice();
 S.notices = S.notices || { brief: 8, news: 0, half: true };
+S.profile = S.profile || { where: "", does: "", papers: "", other: "" };   // About the household; blank until he's told
+S.quiet = S.quiet || { from: 0, to: 0 };                                     // quiet hours; the same hour twice means off
+S.habits = S.habits || [];                                                   // recent fetches, {n, at}; S.routine is the older ledger
+if (S.symbols === undefined) S.symbols = true;                               // small pictures beside rows
 function addressee() { return S.address === "name" ? S.name : S.address === "custom" ? S.custom : S.address; }
+// What he has been told about the household, as plain sentences for the
+// thinking machine. Anything left blank is left unsaid.
+const clean = s => String(s || "").trim().replace(/[.\s]+$/, "");
+function profileLines() {
+  const p = S.profile || {}, bits = [];
+  if (clean(p.where)) bits.push(`He lives in ${clean(p.where)}.`);
+  if (clean(p.does)) bits.push(`What he does: ${clean(p.does)}.`);
+  if (clean(p.papers)) bits.push(`In the papers he wants flagged: ${clean(p.papers)}.`);
+  if (clean(p.other)) bits.push(`Also: ${clean(p.other)}.`);
+  return bits.join("\n");
+}
+
+// ───────────────────────── What went wrong ─────────────────────────
+// Failures are kept here, with their particulars, for the screen below
+// stairs. Aloud he only ever says that something isn't answering.
+const faultsPath = fm.joinPath(dir, "faults.json");
+function readFaults() {
+  try { if (fm.fileExists(faultsPath)) { fm.downloadFileFromiCloud(faultsPath); return JSON.parse(fm.readString(faultsPath)); } } catch (e) {}
+  return [];
+}
+function fault(where, detail) {
+  try {
+    const list = readFaults();
+    list.push({ at: new Date().toISOString(), where, detail: String(detail || "").slice(0, 400) });
+    fm.writeString(faultsPath, JSON.stringify(list.slice(-20)));
+  } catch (e) {}
+}
+function clearFaults() { try { fm.writeString(faultsPath, "[]"); } catch (e) {} }
 
 // ───────────────────────── Voice ─────────────────────────
 // ElevenLabs when a key and voice are held; the iPhone's own voice otherwise.
@@ -171,7 +212,7 @@ let lastVoiceError = "";
 function say(t) {
   if (!S.speak) return;
   if (hasEleven()) {
-    lastSpeech = elevenSpeak(t).catch(e => { lastVoiceError = String(e && e.message || e); Speech.speak(t); });
+    lastSpeech = elevenSpeak(t).catch(e => { lastVoiceError = String(e && e.message || e); fault("His voice", lastVoiceError); Speech.speak(t); });
   } else {
     Speech.speak(t);
   }
@@ -192,6 +233,20 @@ function niceDay(d) {
   if (sameDay(d, tom)) return "tomorrow";
   const df = new DateFormatter(); df.dateFormat = "EEEE d MMMM"; return df.string(d);
 }
+// How an engagement's time is spoken. Timed: "at 2 in the afternoon".
+// All day: the day word you supply. Running over several days: "all week"
+// or "until Friday", rather than pretending it starts at midnight.
+function spanWords(e) {
+  if (!e.isAllDay) return "";
+  const days = Math.round((e.endDate - e.startDate) / 86400000);
+  if (days <= 1) return "";
+  if (days === 7) return "all week";
+  const last = new Date(e.endDate.getTime() - 1); // an all-day entry ends at the following midnight
+  const df = new DateFormatter(); df.dateFormat = days > 7 ? "EEEE d MMMM" : "EEEE";
+  return "until " + df.string(last);
+}
+function eventWords(e, dayWord) { return e.isAllDay ? (spanWords(e) || dayWord || "all day") : "at " + niceTime(e.startDate); }
+function tomorrowWords(e) { return e.isAllDay ? (spanWords(e) ? "from tomorrow, " + spanWords(e) : "tomorrow") : "tomorrow at " + niceTime(e.startDate); }
 // Pulls a date and time out of plain words. Returns {date, hasTime, rest}.
 function parseWhen(text) {
   let t = " " + text.toLowerCase() + " ", d = new Date(), hasTime = false, found = false;
@@ -255,20 +310,54 @@ function firstPhone(c) { return c.phoneNumbers && c.phoneNumbers.length ? c.phon
 function firstEmail(c) { return c.emailAddresses && c.emailAddresses.length ? c.emailAddresses[0].value : null; }
 
 // ───────────────────────── Apps & routine ─────────────────────────
-function slotKey(off = 0) { const d = new Date(); return `${d.getDay()}-${d.getHours() + off}`; }
+// He notes when each app is fetched and, from that, what you tend to want
+// about now. Recent habits count for more than old ones; weekdays and
+// weekends are kept apart; the hour and the broader part of the day both
+// weigh. Older editions kept counts by weekday and hour in S.routine; those
+// still count, faintly, until the routine is forgotten.
+function band(h) { return h < 12 ? "morning" : h < 14 ? "midday" : h < 18 ? "afternoon" : "evening"; }
+function isWeekend(d) { return d.getDay() === 0 || d.getDay() === 6; }
 async function fetchApp(app) {
-  const k = slotKey(); S.routine[k] = S.routine[k] || {}; S.routine[k][app.n] = (S.routine[k][app.n] || 0) + 1;
+  S.habits.push({ n: app.n, at: new Date().toISOString() });
+  if (S.habits.length > 400) S.habits = S.habits.slice(-400);
   const today = new Date().toDateString(); S.daily = S.daily && S.daily.day === today ? S.daily : { day: today, counts: {} };
   S.daily.counts[app.n] = (S.daily.counts[app.n] || 0) + 1; save();
   say(S.daily.counts[app.n] >= 3 ? P.fetchingAgain(app.n) : P.fetching(app.n)); await Safari.open(app.u);
 }
+function habitScores() {
+  const now = new Date(), h = now.getHours(), wk = isWeekend(now), b = band(h);
+  const scores = {}, lastOpen = {};
+  for (const x of S.habits || []) {
+    const d = new Date(x.at); if (isNaN(d)) continue;
+    let w = Math.pow(0.5, (now - d) / 86400000 / 30);     // half its weight every month
+    w *= isWeekend(d) === wk ? 1 : 0.3;
+    const dh = Math.abs(d.getHours() - h);
+    w *= dh <= 1 ? 1 : band(d.getHours()) === b ? 0.5 : 0;
+    if (w) scores[x.n] = (scores[x.n] || 0) + w;
+    if (!lastOpen[x.n] || d > lastOpen[x.n]) lastOpen[x.n] = d;
+  }
+  for (const k in S.routine || {}) {                      // the old ledger, faded
+    const [day, hour] = k.split("-").map(Number);
+    if (isNaN(day) || isNaN(hour) || (day === 0 || day === 6) !== wk) continue;
+    const dh = Math.abs(hour - h);
+    const f = dh <= 1 ? 0.3 : band(hour) === b ? 0.15 : 0;
+    if (!f) continue;
+    for (const n in S.routine[k]) scores[n] = (scores[n] || 0) + (S.routine[k][n] || 0) * f;
+  }
+  return { scores, lastOpen };
+}
+// One suggestion, and whether he is sure of it. Returns { app, confident }.
 function suggestion() {
-  let best = null, n = 0;
-  for (const off of [0, -1, 1]) { const r = S.routine[slotKey(off)] || {}; for (const k in r) if (r[k] > n) { n = r[k]; best = k; } }
-  let app = best && S.apps.find(a => a.n === best);
-  if (app) return app;
+  const { scores, lastOpen } = habitScores();
+  const justHad = n => lastOpen[n] && (Date.now() - lastOpen[n]) < 30 * 60 * 1000;
+  const ranked = Object.keys(scores).filter(n => !justHad(n) && S.apps.some(a => a.n === n)).sort((a, b) => scores[b] - scores[a]);
+  if (ranked.length && scores[ranked[0]] >= 1.5) {
+    const top = scores[ranked[0]], second = ranked[1] ? scores[ranked[1]] : 0;
+    return { app: S.apps.find(a => a.n === ranked[0]), confident: top >= 3 && top >= second * 1.5 };
+  }
   const h = new Date().getHours(), want = h < 9 ? "Hand Terminal" : h < 18 ? "WhatsApp" : "Pocket Casts";
-  return S.apps.find(a => a.n === want) || S.apps[0];
+  const rested = S.apps.filter(a => !justHad(a.n));
+  return { app: rested.find(a => a.n === want) || rested[0] || S.apps[0], confident: false };
 }
 function findApp(name) {
   const n = name.toLowerCase();
@@ -278,7 +367,7 @@ function findApp(name) {
 
 // ───────────────────────── His memory ─────────────────────────
 // A journal of what you've told him and what he's done, kept as one file.
-// This is what lets him answer "what was I meant to do about the podcast?"
+// This is what lets him answer "what was I meant to do about the dentist?"
 // and understand "move that to Thursday".
 const journalPath = fm.joinPath(dir, "journal.json");
 let J = loadJournal();
@@ -378,30 +467,47 @@ function restoreNames(text) {
 // ───────────────────────── Talking with him ─────────────────────────
 // A short-lived transcript so "that" and "she" mean something.
 let turns = [];
-async function context() {
-  const bits = [];
-  bits.push(`Today is ${new Date().toString()}.`);
+// What he knows, in order of importance, within a fixed budget. The top of
+// the list is never cut; whatever doesn't fit is trimmed from the bottom.
+const CONTEXT_BUDGET = 6000;
+async function context(history) {
+  const items = [];
+  items.push(`Today is ${new Date().toString()}.`);
   try {
-    const today = (await eventsToday()).map(e => `${e.title}${e.isAllDay ? " (all day)" : " at " + niceTime(e.startDate)}`);
-    const tom = (await eventsTomorrow()).map(e => `${e.title}${e.isAllDay ? " (all day)" : " at " + niceTime(e.startDate)}`);
-    if (today.length) bits.push("Today's diary: " + today.join("; ") + ".");
-    if (tom.length) bits.push("Tomorrow: " + tom.join("; ") + ".");
+    const today = (await eventsToday()).map(e => `${e.title} ${eventWords(e, "all day")}`);
     const due = (await remindersDue()).map(r => r.title);
-    if (due.length) bits.push("Reminders due: " + due.join("; ") + ".");
+    items.push((today.length ? "Today's diary: " + today.join("; ") + "." : "Nothing in today's diary.") + (due.length ? " Reminders due: " + due.join("; ") + "." : ""));
+    const tom = (await eventsTomorrow()).map(e => `${e.title} ${eventWords(e, "all day")}`);
+    if (tom.length) items.push("Tomorrow: " + tom.join("; ") + ".");
   } catch (e) {}
-  const notes = recentNotes(25);
-  if (notes.length) bits.push("Things he has told you, most recent last:\n" + notes.map(n => `- (${n.at.slice(0, 10)}) ${n.t}`).join("\n"));
+  if (history) items.push("The conversation so far:\n" + history);
+  const who = profileLines();
+  if (who) items.push("About the household:\n" + who);
+  const notes = recentNotes(40), recent = notes.slice(-12), older = notes.slice(0, -12);
+  const line = n => `- (${n.at.slice(0, 10)}) ${n.t}`;
+  if (recent.length) items.push("Things he has told you, most recent last:\n" + recent.map(line).join("\n"));
   const acts = J.acts.slice(-8);
-  if (acts.length) bits.push("Recently done for him:\n" + acts.map(a => `- (${a.at.slice(0, 10)}) ${a.t}`).join("\n"));
-  const apps = S.apps.map(a => a.n).join(", ");
-  bits.push("Apps he can be brought: " + apps + ".");
+  if (acts.length) items.push("Recently done for him:\n" + acts.map(a => `- (${a.at.slice(0, 10)}) ${a.t}`).join("\n"));
+  items.push("Apps he can be brought: " + S.apps.map(a => a.n).join(", ") + ".");
   const proj = projectSummary(1500);
-  if (proj) bits.push("His own records, from his apps:\n" + proj.slice(0, 4000));
-  return bits.join("\n\n");
+  if (proj) items.push("His own records, from his apps:\n" + proj);
+  if (older.length) items.push("Older notes, oldest first:\n" + older.map(line).join("\n"));
+  return fitBudget(items, CONTEXT_BUDGET);
+}
+function fitBudget(items, budget) {
+  const out = []; let left = budget;
+  for (const it of items) {
+    const sep = out.length ? 2 : 0;
+    if (it.length + sep <= left) { out.push(it); left -= it.length + sep; }
+    else if (left - sep > 200) { out.push(it.slice(0, left - sep - 1) + "…"); break; }
+    else break;
+  }
+  return out.join("\n\n");
 }
 
 function personaPrompt(addr) {
-  return `You are a valet — a dry, withering but entirely loyal English gentleman's gentleman in the manner of Hobson in the film Arthur. You serve ${addr}, who is blind, uses VoiceOver, lives in Sligo, Ireland, and co-hosts an assistive-technology podcast called the Tech Doc Podcast.
+  const who = profileLines();
+  return `You are a valet — a dry, withering but entirely loyal English gentleman's gentleman in the manner of Hobson in the film Arthur. You serve ${addr}.${who ? "\n\n" + who : ""}
 
 Speak aloud, so: plain prose, no markdown, no lists, no headings. Two or three short sentences at most unless asked for more. Deadpan, precise, never cruel; at most one barb per reply, often none. Facts straight; wit only in the asides. Never mention being an AI or a model.
 
@@ -419,11 +525,11 @@ Reply with ONE JSON object and nothing else:
 Use "none" when he only wants an answer or conversation — then "say" carries the whole reply. Use "note" when he tells you something to keep; put the thing to remember in "body". Only choose an action when he has actually asked for one.`;
 
   const history = turns.slice(-6).map(t => `${t.who === "him" ? "He said" : "You said"}: ${t.text}`).join("\n");
-  const prompt = `${await context()}\n\n${history ? "The conversation so far:\n" + history + "\n\n" : ""}He now says: ${text}`;
+  const prompt = `${await context(history)}\n\nHe now says: ${text}`;
 
   let j;
   try { const out = await gemini(sys, prompt, true); j = JSON.parse(out.replace(/```json|```/g, "").trim()); }
-  catch (e) { return { say: P.machineFailed + " " + (lastMachineError || ""), intent: "none" }; }
+  catch (e) { return { say: P.machineFailed + " " + P.detailsBelow, intent: "none" }; }
   if (j && j.say) j.say = restoreNames(j.say);
   if (j && j.body) j.body = restoreNames(j.body);
   return j;
@@ -482,10 +588,10 @@ async function brief() {
   const today = (await eventsToday()).filter(e => e.endDate > new Date());
   if (today.length) {
     const e = today[0];
-    parts.push(`${e.title}${e.isAllDay ? " today" : " at " + niceTime(e.startDate)}.` + (today.length > 1 ? ` ${today.length - 1} more after that.` : ""));
+    parts.push(`${e.title} ${eventWords(e, "today")}.` + (today.length > 1 ? ` ${today.length - 1} more after that.` : ""));
   } else {
     const tom = await eventsTomorrow();
-    if (tom.length) parts.push(`${tom[0].title} tomorrow${tom[0].isAllDay ? "" : " at " + niceTime(tom[0].startDate)}.`);
+    if (tom.length) parts.push(`${tom[0].title} ${tomorrowWords(tom[0])}.`);
     else parts.push(h < 18 ? P.nothingToday : P.quiet);
   }
   const due = await remindersDue();
@@ -504,9 +610,10 @@ function decode(s) {
 async function fetchPaper(feed) {
   const r = new Request(feed.u); r.timeoutInterval = 8;
   let xml = "";
-  try { xml = await r.loadString(); } catch (e) { return { paper: feed, items: [], error: "no reply: " + (e.message || e) }; }
+  const failed = error => { fault("The newsagent", `${feed.n}: ${error}`); return { paper: feed, items: [], error }; };
+  try { xml = await r.loadString(); } catch (e) { return failed("no reply: " + (e.message || e)); }
   const code = r.response && r.response.statusCode;
-  if (code && code !== 200) return { paper: feed, items: [], error: `said ${code}` };
+  if (code && code !== 200) return failed(`said ${code}`);
   const items = [];
   const blocks = xml.match(/<item[\s>][\s\S]*?<\/item>/g) || xml.match(/<entry[\s>][\s\S]*?<\/entry>/g) || [];
   for (const b of blocks.slice(0, 3)) {
@@ -515,7 +622,7 @@ async function fetchPaper(feed) {
     const summary = (b.match(/<(?:description|summary|content)[^>]*>([\s\S]*?)<\/(?:description|summary|content)>/) || [])[1] || "";
     if (title) items.push({ title: decode(title), link: decode(link), summary: decode(summary).slice(0, 220) });
   }
-  if (!items.length) return { paper: feed, items, error: blocks.length ? "arrived, but I couldn't read it" : "arrived, but it isn't a feed I recognise" };
+  if (!items.length) return failed(blocks.length ? "arrived, but couldn't be read" : "arrived, but isn't a feed I recognise");
   return { paper: feed, items };
 }
 async function fetchPapers() { return await Promise.all(S.feeds.map(fetchPaper)); }
@@ -528,24 +635,24 @@ function papersSpeech(papers) {
   return bits.length ? bits.join(" ") + " " + P.papersDone : P.papersEmpty;
 }
 
-// Gemini writes the brief in his voice, flagging anything for the podcast.
+// Gemini writes the brief in his voice, flagging anything he's been asked to.
 async function papersBrief(papers) {
-  const key = Keychain.get("valet.gemini");
   const raw = papers.filter(p => p.items.length).map(p => `${p.paper.n}${p.paper.tag ? " (" + p.paper.tag + ")" : ""}:\n` + p.items.map(i => `- ${i.title}${i.summary ? " — " + i.summary : ""}`).join("\n")).join("\n\n");
-  const sys = `You are ${S.valet}, a dry, withering but loyal English gentleman's gentleman in the manner of Hobson in the film Arthur — deadpan, precise, too well-mannered to insult you outright and letting you hear it anyway — giving a spoken morning news brief to ${addressee()}, who is blind, lives in Sligo, Ireland, and co-hosts a podcast about assistive technology called the Tech Doc Podcast. Write two or three short paragraphs of plain prose, under 140 words, no headings or lists, no markdown. Summarise only what is in the headlines given; do not invent detail. Mention anything from feeds tagged "tech" as worth noting for the podcast. Keep the news itself straight and accurate; put the wit in one or two asides and a closing barb. Never more than one barb per paragraph. Address them as "${addressee()}" once at most.`;
+  const who = profileLines().replace(/\n/g, " ");
+  const flagged = clean(S.profile && S.profile.papers) ? ` He has asked that anything touching on ${clean(S.profile.papers)} be pointed out.` : "";
+  const sys = `You are ${S.valet}, a dry, withering but loyal English gentleman's gentleman in the manner of Hobson in the film Arthur — deadpan, precise, too well-mannered to insult you outright and letting you hear it anyway — giving a spoken morning news brief to ${addressee()}.${who ? " " + who : ""} Write two or three short paragraphs of plain prose, under 140 words, no headings or lists, no markdown. Summarise only what is in the headlines given; do not invent detail. A paper marked with a word in brackets is one he has flagged; mention anything from it as worth his particular attention.${flagged} Keep the news itself straight and accurate; put the wit in one or two asides and a closing barb. Never more than one barb per paragraph. Address them as "${addressee()}" once at most.`;
   try { return (await gemini(sys, raw, false)).trim(); } catch (e) { return null; }
 }
 
 async function papers(spokenOnly) {
   try { await papersInner(spokenOnly); }
-  catch (e) { await tell("The papers fell apart in my hands: " + (e.message || e)); }
+  catch (e) { fault("The papers", e && e.message || e); await tell(P.papersEmpty + " " + P.detailsBelow); }
 }
 async function papersInner(spokenOnly) {
   let ps;
-  try { ps = await fetchPapers(); } catch (e) { return await tell(P.papersEmpty + " " + (e.message || e)); }
+  try { ps = await fetchPapers(); } catch (e) { fault("The newsagent", e && e.message || e); return await tell(P.papersEmpty + " " + P.detailsBelow); }
   const any = ps.some(p => p.items.length);
-  const failures = ps.filter(p => p.error).map(p => `${p.paper.n} ${p.error}`);
-  if (!any) return await tell(P.papersEmpty + (failures.length ? " " + failures.join(". ") + "." : ""));
+  if (!any) return await tell(P.papersEmpty + " " + P.detailsBelow);
   const hasKey = Keychain.contains("valet.gemini");
   if (spokenOnly) {
     const text = hasKey ? (await papersBrief(ps)) || papersSpeech(ps) : papersSpeech(ps);
@@ -553,12 +660,12 @@ async function papersInner(spokenOnly) {
   }
   const table = new UITable(); table.showSeparators = true;
   let next = null;
-  table.addRow(row("The morning's papers. Tap a headline if you must know more.", null, null));
-  if (hasKey) table.addRow(row("Read me the brief", "He summarises the lot", () => { next = async () => { const t = await papersBrief(ps); await tell(t || (lastMachineError ? "The machine wouldn't write it: " + lastMachineError : papersSpeech(ps))); }; }));
-  table.addRow(row("Read me the headlines", null, () => { next = async () => { await tell(papersSpeech(ps)); }; }));
+  table.addRow(infoRow("The morning's papers. Tap a headline if you must know more."));
+  if (hasKey) table.addRow(actionRow("Read me the brief", "He summarises the lot", () => { next = async () => { const t = await papersBrief(ps); await tell(t || (lastMachineError ? P.machineFailed + " " + papersSpeech(ps) : papersSpeech(ps))); }; }));
+  table.addRow(actionRow("Read me the headlines", null, () => { next = async () => { await tell(papersSpeech(ps)); }; }));
   ps.forEach(p => {
-    table.addRow(header(p.paper.n));
-    if (!p.items.length) { table.addRow(row(`Didn't arrive: ${p.error}`, null, null)); return; }
+    table.addRow(headerRow(p.paper.n));
+    if (!p.items.length) { table.addRow(infoRow("Didn't arrive", "The particulars are below stairs")); return; }
     p.items.forEach(i => table.addRow(row(i.title, i.summary || null, () => { next = () => Safari.open(i.link); })));
   });
   await table.present(false); if (next) await next();
@@ -627,7 +734,7 @@ async function scheduleNotices() {
     const pending = await Notification.allPending();
     for (const n of pending) if (n.identifier && n.identifier.startsWith("valet.")) n.remove();
     const mk = (id, body, when) => {
-      if (when <= new Date()) return;
+      if (when <= new Date() || inQuietHours(when)) return;
       const n = new Notification(); n.identifier = id; n.title = S.valet; n.body = body; n.scriptName = Script.name(); n.sound = "default";
       n.setTriggerDate(when); n.schedule();
     };
@@ -640,6 +747,15 @@ async function scheduleNotices() {
     }
   } catch (e) {}
 }
+// Quiet hours: no notices, and a shorter brief on the widget. Off unless
+// two different hours are set; may run across midnight.
+function inQuietHours(d) {
+  const q = S.quiet || {};
+  if (!q.from && !q.to) return false;
+  if (q.from === q.to) return false;
+  const h = (d || new Date()).getHours();
+  return q.from < q.to ? (h >= q.from && h < q.to) : (h >= q.from || h < q.to);
+}
 
 // ───────────────────────── Understanding ─────────────────────────
 async function handle(text) {
@@ -647,7 +763,7 @@ async function handle(text) {
   const low = t.toLowerCase();
   let m;
 
-  // Messages: "message Jackie running late", "text Pat ...", "whatsapp Ken ..."
+  // Messages: "message Margaret running late", "text Tom ...", "whatsapp Ann ..."
   if ((m = low.match(/^(message|whatsapp|tell)\s+([a-z' -]+?)\s+(?:that\s+|to\s+say\s+)?(.+)$/))) return await sendWhatsApp(m[2], m[3]);
   if ((m = low.match(/^(text|sms)\s+([a-z' -]+?)\s+(?:that\s+)?(.+)$/))) return await sendText(m[2], m[3]);
   if ((m = low.match(/^(email|e-mail|mail|write to)\s+([a-z' -]+?)(?:\s+(?:about|re|saying)\s+(.+))?$/))) return await sendEmail(m[2], m[3] || "");
@@ -680,6 +796,9 @@ async function handle(text) {
   const name = low.replace(/^(bring me|bring|fetch|open|get me|get|the)\s+/, "").replace(/^the\s+/, "").trim();
   const app = findApp(name); if (app) return await fetchApp(app);
   const duty = DUTIES.find(d => d.name.toLowerCase().includes(name) || d.id.includes(name)); if (duty) return await openDuty(duty);
+
+  // This edition
+  if (/^(what('s| is| has) (new|changed)|what changed)\b/.test(low)) return await tell(P.changesIntro + " " + CHANGES.join(" "));
 
   // Remembering and recalling
   if ((m = low.match(/^(remember|note|keep in mind|don't forget)(?: that)?\s+(.+)$/))) { remember(m[2], "told"); return await tell(P.remembered); }
@@ -733,7 +852,7 @@ async function ringUp(who) {
 }
 async function readEvents(list, label) {
   if (!list.length) return await tell(`Nothing ${label}.`);
-  const lines = list.map(e => `${e.title}${e.isAllDay ? "" : ", " + niceTime(e.startDate)}${label === "this week" ? " " + niceDay(e.startDate) : ""}`);
+  const lines = list.map(e => `${e.title}${e.isAllDay ? (spanWords(e) ? ", " + spanWords(e) : "") : ", " + niceTime(e.startDate)}${label === "this week" ? " " + niceDay(e.startDate) : ""}`);
   await tell(`${cap(label)}: ${lines.join(". ")}.`);
 }
 
@@ -758,28 +877,51 @@ async function gemini(sys, text, wantJson) {
     }
     if (code === 404) { lastMachineError = `Model ${model} not found.`; continue; } // try the next name
     if (code === 503 || code === 429) { lastMachineError = `${model} is busy (${code}).`; continue; } // try a sibling
-    if (code !== 200) { lastMachineError = (res && res.error && res.error.message) ? `Google said ${code}: ${res.error.message}` : `Google said ${code}.`; throw new Error(lastMachineError); }
+    if (code !== 200) {
+      if (code !== 0) lastMachineError = (res && res.error && res.error.message) ? `Google said ${code}: ${res.error.message}` : `Google said ${code}.`; // code 0: keep the "no reply" reason
+      fault("The thinking machine", lastMachineError); throw new Error(lastMachineError);
+    }
     try {
       const out = res.candidates[0].content.parts[0].text;
       if (model !== S.model) { S.model = model; save(); }
       lastMachineError = "";
       return out;
-    } catch (e) { lastMachineError = "Google replied, but not with words I could use."; throw new Error(lastMachineError); }
+    } catch (e) { lastMachineError = "Google replied, but not with words I could use."; fault("The thinking machine", lastMachineError); throw new Error(lastMachineError); }
   }
-  throw new Error(lastMachineError || "No model would answer.");
+  lastMachineError = lastMachineError || "No model would answer.";
+  fault("The thinking machine", lastMachineError);
+  throw new Error(lastMachineError);
 }
 
 // ───────────────────────── Screens ─────────────────────────
-function row(title, subtitle, onSelect, dismiss = true) {
-  const r = new UITableRow(); r.height = subtitle ? 70 : 54;
-  const c = subtitle ? UITableCell.text(title, subtitle) : UITableCell.text(title); c.leftAligned(); r.addCell(c);
-  if (onSelect) { r.onSelect = onSelect; r.dismissOnSelect = dismiss; }
+// Every row is built here, so the look lives in one place. Four kinds: a
+// header, a line of information, something to tap, and something to tap
+// that destroys. A destructive row says so in its words, not only its
+// colour. A symbol beside a row is for sighted eyes; it goes in as a second
+// cell so the spoken text is unchanged, and can be turned off below stairs.
+const SYMBOLS = { correspondence: "envelope", diary: "calendar", reminders: "checklist", papers: "newspaper", study: "book", wireless: "radio", errands: "cart", below: "wrench.and.screwdriver" };
+function buildRow(title, subtitle, onSelect, symbol, destructive) {
+  const r = new UITableRow();
+  r.height = subtitle ? 70 : Math.min(120, 54 + Math.floor(String(title).length / 48) * 18); // long lines get room
+  const pic = symbol && S.symbols !== false;
+  if (pic) { try { const im = UITableCell.image(SFSymbol.named(symbol).image); im.widthWeight = 12; r.addCell(im); } catch (e) {} }
+  const c = subtitle ? UITableCell.text(title, subtitle) : UITableCell.text(title);
+  c.leftAligned(); c.widthWeight = pic ? 88 : 100;
+  if (destructive) c.titleColor = Color.red();
+  r.addCell(c);
+  if (onSelect) { r.onSelect = onSelect; r.dismissOnSelect = true; }
   return r;
 }
-function header(text) { const r = new UITableRow(); r.isHeader = true; r.height = 40; r.addCell(UITableCell.text(text)); return r; }
+function headerRow(text) { const r = new UITableRow(); r.isHeader = true; r.height = 40; r.addCell(UITableCell.text(text)); return r; }
+function infoRow(title, subtitle) { return buildRow(title, subtitle || null, null, null, false); }
+function actionRow(title, subtitle, onSelect, symbol) { return buildRow(title, subtitle || null, onSelect, symbol || null, false); }
+function destructiveRow(title, subtitle, onSelect) { return buildRow(title, subtitle || null, onSelect, null, true); }
+// The older names, kept so every screen reads the same.
+function row(title, subtitle, onSelect, dismiss = true) { const r = buildRow(title, subtitle, onSelect, null, false); if (onSelect) r.dismissOnSelect = dismiss; return r; }
+function header(text) { return headerRow(text); }
 
 async function askTyped() {
-  const a = new Alert(); a.title = S.valet; a.message = "Yes?"; a.addTextField("Message Jackie running late", "");
+  const a = new Alert(); a.title = S.valet; a.message = "Yes?"; a.addTextField("Message Margaret running late", "");
   a.addAction("Go"); a.addCancelAction("Never mind");
   if ((await a.present()) === 0) await handle(a.textFieldValue(0));
 }
@@ -788,24 +930,41 @@ async function askSpoken() {
   try { const t = await Dictation.start("en-GB"); if (t) await handle(t); } catch (e) {}
 }
 
+// The front door. In order: his briefing; what genuinely requires you;
+// his one suggestion; three ways of asking him; the household.
 async function home() {
   while (true) {
     const b = await brief(); const sug = suggestion();
     const table = new UITable(); table.showSeparators = true;
-    table.addRow(row(b.text + " " + P.fetch(sug.n), null, null));
     let action = null;
-    table.addRow(row(`Yes, ${sug.n}`, null, () => { action = () => fetchApp(sug); }));
-    table.addRow(row("Ask him", "Type a request", () => { action = askTyped; }));
-    table.addRow(row("Speak to him", "Dictate a request", () => { action = askSpoken; }));
-    if (Keychain.contains("valet.gemini")) table.addRow(row("Talk with him", "Back and forth, until you're done", () => { action = () => conversation(""); }));
-    table.addRow(row("The papers", "Headlines, or a brief", () => { action = () => papers(false); }));
-    table.addRow(row("Something else", "The household", () => { action = household; }));
-    if (b.today.length) { table.addRow(header("Later today")); b.today.forEach(e => table.addRow(row(e.title, e.isAllDay ? "All day" : niceTime(e.startDate), null))); }
-    if (b.due.length) {
-      table.addRow(header("Due today — tap to tick off"));
-      b.due.forEach(r => table.addRow(row(r.title, r.dueDate && sameDay(r.dueDate, new Date()) && r.dueDate.getHours() ? niceTime(r.dueDate) : null, () => { action = async () => { r.isCompleted = true; r.save(); say(P.done); }; })));
+    table.addRow(infoRow(b.text));
+
+    const now = new Date();
+    const soon = b.today.filter(e => !e.isAllDay && e.startDate > now && e.startDate - now < 4 * 3600 * 1000)[0];
+    const leave = await leaveBy(b.today);
+    if (soon || leave || b.due.length) {
+      table.addRow(headerRow("What requires you"));
+      if (soon) table.addRow(infoRow(soon.title, cap(niceTime(soon.startDate))));
+      if (leave) table.addRow(infoRow(leave));
+      b.due.forEach(r => table.addRow(actionRow(r.title, "Due today. Tap to tick it off", () => { action = async () => { r.isCompleted = true; r.save(); say(P.done); }; })));
     }
-    say(b.text + " " + P.fetch(sug.n));
+
+    // He is observant, not insistent: the fuller phrasing at most once a day, and only when sure.
+    const today = now.toDateString();
+    const usual = sug.app && sug.confident && S.usualDay !== today;
+    if (usual) { S.usualDay = today; save(); }
+    if (sug.app) table.addRow(actionRow(usual ? P.usual(sug.app.n) : P.fetch(sug.app.n), null, () => { action = () => fetchApp(sug.app); }));
+
+    table.addRow(headerRow("Ask him"));
+    table.addRow(actionRow("Type a request", null, () => { action = askTyped; }, "keyboard"));
+    table.addRow(actionRow("Speak to him", "Dictate a request", () => { action = askSpoken; }, "mic"));
+    if (Keychain.contains("valet.gemini")) table.addRow(actionRow("Talk with him", "Back and forth, until you're done", () => { action = () => conversation(""); }, "bubble.left.and.bubble.right"));
+
+    table.addRow(headerRow("The household"));
+    DUTIES.forEach(d => table.addRow(actionRow(d.name, null, () => { action = () => openDuty(d); }, SYMBOLS[d.id])));
+    table.addRow(actionRow("Below stairs", "Settings and arrangements", () => { action = belowStairs; }, SYMBOLS.below));
+
+    say(b.text); // the briefing only; the rows say themselves
     await table.present(false);
     if (!action) return; // dismissed — he withdraws
     await action();
@@ -848,7 +1007,7 @@ async function correspondence() {
 async function promptSend(kind) {
   const a = new Alert(); a.title = S.valet;
   a.message = kind === "ring" ? "Whom shall I ring?" : "To whom, and what shall I say?";
-  a.addTextField(kind === "ring" ? "Jackie" : "Jackie, running ten minutes late", "");
+  a.addTextField(kind === "ring" ? "Margaret" : "Margaret, running ten minutes late", "");
   a.addAction("Very good"); a.addCancelAction("Never mind");
   if ((await a.present()) !== 0) return;
   const v = a.textFieldValue(0).trim(); if (!v) return;
@@ -862,8 +1021,9 @@ async function diaryTable() {
   table.addRow(row(list.length ? "The week ahead. Brace yourself." : P.diaryEmpty, null, null));
   let next = null;
   table.addRow(row("Make an entry", "Say what and when", () => { next = async () => { const a = new Alert(); a.title = "An entry"; a.addTextField("Dentist Tuesday at 2", ""); a.addAction("Note it"); a.addCancelAction("Never mind"); if ((await a.present()) === 0) await handle("add " + a.textFieldValue(0)); }; }));
-  list.forEach(e => table.addRow(row(e.title, `${cap(niceDay(e.startDate))}${e.isAllDay ? "" : ", " + niceTime(e.startDate)}`, () => { next = async () => {
-    const a = new Alert(); a.title = e.title; a.message = `${cap(niceDay(e.startDate))}${e.isAllDay ? "" : ", " + niceTime(e.startDate)}`; a.addDestructiveAction("Strike it out"); a.addCancelAction("Leave it");
+  const when = e => `${cap(niceDay(e.startDate))}${e.isAllDay ? (spanWords(e) ? ", " + spanWords(e) : "") : ", " + niceTime(e.startDate)}`;
+  list.forEach(e => table.addRow(row(e.title, when(e), () => { next = async () => {
+    const a = new Alert(); a.title = e.title; a.message = when(e); a.addDestructiveAction("Strike it out"); a.addCancelAction("Leave it");
     if ((await a.present()) === 0) { e.remove(); say(P.struck); }
   }; })));
   await table.present(false); if (next) await next();
@@ -874,20 +1034,30 @@ async function remindersTable() {
   const table = new UITable(); table.showSeparators = true;
   table.addRow(row(all.length ? "Outstanding. Tap one to tick it off, and I shall pretend not to be surprised." : P.remindersEmpty, null, null));
   let next = null;
-  table.addRow(row("Add one", null, () => { next = async () => { const a = new Alert(); a.title = "Not to be forgotten"; a.addTextField("Invoice DigiCoach on Friday", ""); a.addAction("Note it"); a.addCancelAction("Never mind"); if ((await a.present()) === 0) await handle("remind me to " + a.textFieldValue(0)); }; }));
+  table.addRow(row("Add one", null, () => { next = async () => { const a = new Alert(); a.title = "Not to be forgotten"; a.addTextField("Invoice the accountant on Friday", ""); a.addAction("Note it"); a.addCancelAction("Never mind"); if ((await a.present()) === 0) await handle("remind me to " + a.textFieldValue(0)); }; }));
   all.forEach(r => table.addRow(row(r.title, r.dueDate ? cap(niceDay(r.dueDate)) : null, () => { next = async () => { r.isCompleted = true; r.save(); say(P.done); }; })));
   await table.present(false); if (next) await next();
 }
 
 async function belowStairs() {
   const table = new UITable(); table.showSeparators = true;
-  table.addRow(row(`Arrangements you'd rather not think about. I've noticed. This is edition ${VERSION}.`, null, null));
+  table.addRow(infoRow(`Arrangements you'd rather not think about. I've noticed. This is edition ${VERSION}.`));
   let next = null;
-  table.addRow(row("Read aloud", S.speak ? "On" : "Off", () => { next = async () => { S.speak = !S.speak; save(); say(`Read aloud is ${S.speak ? "on" : "off"}.`); }; }));
-  table.addRow(row("The weather", S.place ? "Fixed to " + S.place : "From wherever you happen to be", () => { next = async () => {
+
+  table.addRow(headerRow("Himself"));
+  table.addRow(actionRow("His name and how he addresses you", `${S.valet}, to ${addressee()}`, () => { next = () => introduce(true); }));
+  table.addRow(actionRow("His voice", hasEleven() ? (lastVoiceError ? "ElevenLabs — last attempt failed, tap for details" : "ElevenLabs") : "The telephone's own voice", () => { next = hisVoice; }));
+  table.addRow(actionRow("Read aloud", S.speak ? "On" : "Off", () => { next = async () => { S.speak = !S.speak; save(); say(`Read aloud is ${S.speak ? "on" : "off"}.`); }; }));
+  table.addRow(actionRow("Pictures beside rows", S.symbols !== false ? "On. Decoration for sighted eyes; VoiceOver is unaffected" : "Off", () => { next = async () => { S.symbols = S.symbols === false; save(); say(`Pictures ${S.symbols ? "on" : "off"}.`); }; }));
+
+  table.addRow(headerRow("The household"));
+  table.addRow(actionRow("About the household", profileSummary(), () => { next = aboutHousehold; }));
+  table.addRow(actionRow("The staff", "Apps and their addresses", () => { next = staff; }));
+  table.addRow(actionRow("The newsagent", `${S.feeds.length} papers taken`, () => { next = newsagent; }));
+  table.addRow(actionRow("The weather", S.place ? "Fixed to " + S.place : "From wherever you happen to be", () => { next = async () => {
     const a = new Alert(); a.title = "The weather";
     a.message = "By default I use the telephone's location. If that's off, name a town and I'll use it instead." + (lastWeatherError ? "\n\nLast failure: " + lastWeatherError : "");
-    a.addTextField("Town, e.g. Sligo", S.place || "");
+    a.addTextField("Town", S.place || "");
     a.addAction("Try it now"); a.addAction("Keep it"); if (S.place) a.addDestructiveAction("Back to my location"); a.addCancelAction("Never mind");
     const i = await a.present(); if (i === -1) return;
     if (S.place && i === 2) { delete S.place; delete S.lat; delete S.lon; save(); const c = readCache(); delete c.wxAt; writeCache(c); return await tell("As you were."); }
@@ -905,14 +1075,9 @@ async function belowStairs() {
       await tell(wx ? (weatherLine(wx) || "Nothing worth remarking on.") : "Still no weather. " + (lastWeatherError || ""));
     } else { await tell(P.arranged); }
   }; }));
-  table.addRow(row("His voice", hasEleven() ? (lastVoiceError ? "ElevenLabs — last attempt failed, tap for details" : "ElevenLabs") : "The telephone's own voice", () => { next = hisVoice; }));
-  table.addRow(row("His name and how he addresses you", null, () => { next = () => introduce(true); }));
-  table.addRow(row("The staff", "Apps and their addresses", () => { next = staff; }));
-  table.addRow(row("The newsagent", `${S.feeds.length} papers taken`, () => { next = newsagent; }));
-  table.addRow(row("What he remembers", `${J.notes.length} notes, ${J.acts.length} actions`, () => { next = journalScreen; }));
-  table.addRow(row("His records", "Files from your own apps that he may read", () => { next = recordsScreen; }));
-  table.addRow(row("Arrangements", noticesSummary(), () => { next = arrangements; }));
-  table.addRow(row("The thinking machine", Keychain.contains("valet.gemini") ? (lastMachineError ? "Key held — last attempt failed, tap for details" : `Key held, using ${S.model}`) : "No key", () => { next = async () => {
+
+  table.addRow(headerRow("His mind"));
+  table.addRow(actionRow("The thinking machine", Keychain.contains("valet.gemini") ? (lastMachineError ? "Key held — last attempt failed, tap for details" : `Key held, using ${S.model}`) : "No key", () => { next = async () => {
     const a = new Alert(); a.title = "The thinking machine";
     a.message = (Keychain.contains("valet.gemini") ? "A Gemini key is held. Paste a new one to replace it, or leave blank to keep it." : "Paste your Gemini key from aistudio.google.com. It goes in the Keychain, not the file.") + (lastMachineError ? "\n\nLast failure: " + lastMachineError : "");
     a.addSecureTextField("Key", ""); a.addAction("Keep it"); a.addAction("Test it"); a.addCancelAction("Never mind");
@@ -921,10 +1086,23 @@ async function belowStairs() {
     if (!Keychain.contains("valet.gemini")) { await tell(P.noKey); return; }
     if (i === 0) { say(P.keySaved); return; }
     try { const out = await gemini("Reply in one short dry sentence, as an English butler.", "Are you there?", false); await tell(`It answers, via ${S.model}: ${out.trim()}`); }
-    catch (e) { await tell("It doesn't answer. " + (lastMachineError || e.message || "")); }
+    catch (e) { await tell(P.machineFailed + " " + P.detailsBelow); }
   }; }));
-  table.addRow(row("Forget the routine he's learned", null, () => { next = async () => { S.routine = {}; save(); say(P.forgot); }; }));
-  table.addRow(row("Dismiss him and start again", null, () => { next = async () => {
+  table.addRow(actionRow("What he remembers", `${J.notes.length} notes, ${J.acts.length} actions`, () => { next = journalScreen; }));
+  table.addRow(actionRow("His records", "Files from your own apps that he may read", () => { next = recordsScreen; }));
+
+  table.addRow(headerRow("Arrangements"));
+  table.addRow(actionRow("Arrangements", noticesSummary(), () => { next = arrangements; }));
+  table.addRow(actionRow("Quiet hours", quietSummary(), () => { next = quietHours; }));
+
+  table.addRow(headerRow("Housekeeping"));
+  table.addRow(actionRow("What went wrong", (() => { const n = readFaults().length; return n ? `${n} on record` : "Nothing on record"; })(), () => { next = wentWrong; }));
+  table.addRow(actionRow("What's changed", `Edition ${VERSION}`, () => { next = whatsChanged; }));
+  table.addRow(destructiveRow("Forget the routine he's learned", "Clears what he knows of your habits. He will ask first", () => { next = async () => {
+    const a = new Alert(); a.message = "Forget the routine? I shall start observing afresh."; a.addDestructiveAction("Forget it"); a.addCancelAction("Keep it");
+    if ((await a.present()) === 0) { S.routine = {}; S.habits = []; delete S.usualDay; save(); say(P.forgot); }
+  }; }));
+  table.addRow(destructiveRow("Dismiss him and start again", "Everything he holds goes. He will ask first", () => { next = async () => {
     const a = new Alert(); a.message = "Dismiss him entirely? Staff and routine will go. Your Calendar and Reminders are untouched, which is more than can be said for his feelings."; a.addDestructiveAction("Dismiss"); a.addCancelAction("Keep him");
     if ((await a.present()) === 0) { fm.remove(statePath); S = load(); await introduce(false); }
   }; }));
@@ -958,14 +1136,14 @@ async function journalScreen() {
   table.addRow(row(J.notes.length ? "Things you've told me. Tap one to strike it out." : P.journalEmpty, null, null));
   let next = null;
   table.addRow(row("Tell me something to keep", null, () => { next = async () => {
-    const a = new Alert(); a.title = "To keep"; a.addTextField("Pat prefers Tuesdays for recording", ""); a.addAction("Keep it"); a.addCancelAction("Never mind");
+    const a = new Alert(); a.title = "To keep"; a.addTextField("The plumber prefers Tuesdays", ""); a.addAction("Keep it"); a.addCancelAction("Never mind");
     if ((await a.present()) === 0) { const v = a.textFieldValue(0).trim(); if (v) { remember(v, "told"); say(P.remembered); } }
   }; }));
   J.notes.slice().reverse().slice(0, 40).forEach(n => table.addRow(row(n.t, n.at.slice(0, 10), () => { next = async () => {
     const a = new Alert(); a.message = n.t; a.addDestructiveAction("Forget it"); a.addCancelAction("Keep it");
     if ((await a.present()) === 0) { J.notes = J.notes.filter(x => x !== n); saveJournal(); say(P.forgotten); }
   }; })));
-  if (J.notes.length) table.addRow(row("Forget everything", "Notes and actions both", () => { next = async () => {
+  if (J.notes.length) table.addRow(destructiveRow("Forget everything", "Notes and actions both. He will ask first", () => { next = async () => {
     const a = new Alert(); a.message = "Forget everything you've told me? Your diary and reminders are untouched."; a.addDestructiveAction("Forget it all"); a.addCancelAction("Never mind");
     if ((await a.present()) === 0) { J = { notes: [], acts: [] }; saveJournal(); say(P.forgotten); }
   }; }));
@@ -987,13 +1165,13 @@ async function newsagent() {
   let next = null;
   table.addRow(row("Take another paper", "One address at a time", () => { next = () => editFeed(null); }));
   table.addRow(row("Import a list", "An OPML file from Lire, Overcast or similar", () => { next = importOPML; }));
-  S.feeds.forEach(f => table.addRow(row(f.n, [f.kind === "podcast" ? "Podcast" : null, f.tag ? "Flagged for the podcast" : null].filter(Boolean).join(" · ") || null, () => { next = () => editFeed(f); })));
+  S.feeds.forEach(f => table.addRow(row(f.n, [f.kind === "podcast" ? "Podcast" : null, f.tag ? "Flagged: " + f.tag : null].filter(Boolean).join(" · ") || null, () => { next = () => editFeed(f); })));
   await table.present(false); if (next) await next();
 }
 async function editFeed(f) {
   const al = new Alert(); al.title = f ? f.n : "Another paper";
   al.addTextField("Name", f ? f.n : ""); al.addTextField("Feed address", f ? f.u : "https://");
-  al.addTextField("Type tech to flag it for the podcast", f && f.tag ? f.tag : "");
+  al.addTextField("A word to flag it by, e.g. tech, or leave blank", f && f.tag ? f.tag : "");
   al.addAction("Very good"); if (f) al.addDestructiveAction("Cancel the subscription"); al.addCancelAction("Never mind");
   const i = await al.present();
   if (i === 0) {
@@ -1046,7 +1224,7 @@ async function hisVoice() {
     say(line);
     try { await lastSpeech; } catch (e) {}
     if (lastVoiceError) {
-      const d = new Alert(); d.title = "That didn't work"; d.message = lastVoiceError + "\n\nIf the audio was fetched, I can play it another way to prove the voice itself is fine.";
+      const d = new Alert(); d.title = "That didn't work"; d.message = P.voiceGone + "\n\nThe particulars: " + lastVoiceError + "\n\nIf the audio was fetched, I can play it another way to prove the voice itself is fine.";
       d.addAction("Play it the other way"); d.addCancelAction("Leave it");
       if ((await d.present()) === 0) {
         try { const data = await elevenAudio(line); const p = fm.joinPath(voiceDir, "test.mp3"); fm.write(p, data); await QuickLook.present(p); }
@@ -1093,8 +1271,80 @@ async function introduce(again) {
     await c.present(); const v = c.textFieldValue(0).trim();
     if (i === 2) { S.address = "name"; S.name = v || "sir"; } else { S.address = "custom"; S.custom = v || "sir"; }
   }
+  if (!again) {
+    // Offered once. Never insisted upon; it lives below stairs thereafter.
+    const d = new Alert(); d.title = n; d.message = P.householdAsk; say(d.message);
+    d.addAction("Tell him now"); d.addCancelAction("Later");
+    if ((await d.present()) === 0) await aboutHousehold();
+  }
   S.introduced = true; save();
   await tell(P.introDone(addressee()));
+}
+
+// ───────────────────────── About the household ─────────────────────────
+// What he may be told about you. All of it optional, all of it blank until
+// you say otherwise, and none of it in the script.
+async function aboutHousehold() {
+  const p = S.profile || {};
+  const a = new Alert(); a.title = "About the household";
+  a.message = "Whatever you tell me here shapes what I say and what I flag. Every line is optional. It stays on the telephone, except when the thinking machine writes for me.";
+  a.addTextField("Where you live", p.where || "");
+  a.addTextField("What you do", p.does || "");
+  a.addTextField("Things worth flagging in the papers", p.papers || "");
+  a.addTextField("Anything else I should know", p.other || "");
+  a.addAction("Very good"); a.addCancelAction("Never mind");
+  if ((await a.present()) !== 0) return false;
+  S.profile = { where: a.textFieldValue(0).trim(), does: a.textFieldValue(1).trim(), papers: a.textFieldValue(2).trim(), other: a.textFieldValue(3).trim() };
+  save(); say(P.householdNoted); return true;
+}
+function profileSummary() {
+  const p = S.profile || {}, n = ["where", "does", "papers", "other"].filter(k => clean(p[k])).length;
+  return n ? `${n} of 4 things told` : "Nothing told yet";
+}
+
+// ───────────────────────── Housekeeping screens ─────────────────────────
+function whenAgo(iso) { const d = new Date(iso); return isNaN(d) ? "" : `${niceDay(d)} at ${niceTime(d)}`; }
+async function wentWrong() {
+  const list = readFaults().slice().reverse();
+  const table = new UITable(); table.showSeparators = true;
+  table.addRow(infoRow(list.length ? "What went wrong, most recent first. I keep the particulars here so I needn't say them aloud." : P.nothingWrong));
+  let next = null;
+  list.forEach(f => table.addRow(infoRow(`${f.where}, ${whenAgo(f.at)}`, f.detail)));
+  if (list.length) table.addRow(destructiveRow("Clear the record", "Forgets these failures. Nothing else is touched", () => { next = async () => {
+    const a = new Alert(); a.message = "Clear the record of what went wrong?"; a.addDestructiveAction("Clear it"); a.addCancelAction("Leave it");
+    if ((await a.present()) === 0) { clearFaults(); lastMachineError = ""; lastVoiceError = ""; lastWeatherError = ""; say(P.forgotten); }
+  }; }));
+  await table.present(false); if (next) await next();
+}
+
+const CHANGES = [
+  "Nothing about you lives in the script any more. Tell me about the household below stairs and I'll write accordingly; say nothing and I'll assume nothing.",
+  "The front door is in order: my briefing, then what requires you, then one suggestion, then three ways of asking me, then the household.",
+  "I weigh recent habits over old ones, keep weekdays apart from weekends, and won't suggest what you've only just had.",
+  "When something fails I say so plainly and keep the particulars under what went wrong, below stairs.",
+  "Below stairs is grouped: himself, the household, his mind, arrangements, housekeeping. Everything is where it was, only tidier.",
+  "Engagements that run for days are said plainly: all week, or until Friday, rather than at midnight.",
+  "Quiet hours, should you want them: no notices, and a one-line brief on the widget."
+];
+async function whatsChanged() {
+  const table = new UITable(); table.showSeparators = true;
+  table.addRow(infoRow(`${P.changesIntro} Edition ${VERSION}.`));
+  CHANGES.forEach(c => table.addRow(infoRow(c)));
+  await table.present(false);
+}
+
+function clockWord(h) { return `${h % 12 || 12} ${h < 12 ? "in the morning" : h < 18 ? "in the afternoon" : "in the evening"}`; }
+function quietSummary() { return S.quiet.from !== S.quiet.to ? `From ${clockWord(S.quiet.from)} until ${clockWord(S.quiet.to)}` : "Off"; }
+async function quietHours() {
+  const a = new Alert(); a.title = "Quiet hours";
+  a.message = "Between these hours I leave no notices and keep the widget to a line. Hours on the 24-hour clock; the same hour twice means off.";
+  a.addTextField("From", String(S.quiet.from)); a.addTextField("Until", String(S.quiet.to));
+  a.addAction("Arrange it"); a.addCancelAction("Never mind");
+  if ((await a.present()) !== 0) return;
+  const f = parseInt(a.textFieldValue(0), 10), t = parseInt(a.textFieldValue(1), 10);
+  if (isNaN(f) || isNaN(t) || f < 0 || f > 23 || t < 0 || t > 23) return await tell("Those aren't hours I recognise.");
+  S.quiet = { from: f, to: t }; save(); await scheduleNotices();
+  say(f === t ? "As you were." : P.quietArranged);
 }
 
 
@@ -1153,6 +1403,7 @@ async function outlook() {
     return wx;
   } catch (e) {
     lastWeatherError = String((e && e.message) || e);
+    fault("The weather", lastWeatherError);
     return (cache && cache.wx) || null;
   }
 }
@@ -1374,16 +1625,16 @@ function remark(kind) {
 // Assemble the paragraph without help.
 function composeBrief(today, tom, due, headline, wx, extra, notes) {
   const parts = [greetingWord() + ", " + addressee() + "."];
-  const short = t => niceTime(t).replace(/ in the (morning|afternoon|evening)/, "");
+  const short = s => s.replace(/ in the (morning|afternoon|evening)/, "");
   if (dayPart() === "evening" && tom.length) {
-    parts.push("That's the day. " + cap(tom[0].title) + " tomorrow" + (tom[0].isAllDay ? "" : " at " + short(tom[0].startDate)) + ".");
+    parts.push("That's the day. " + cap(tom[0].title) + " " + short(tomorrowWords(tom[0])) + ".");
   } else if (today.length) {
     const e = today[0];
-    parts.push(cap(e.title) + (e.isAllDay ? " today" : " at " + short(e.startDate)) + ".");
-    if (today.length === 2) parts.push("One more after that: " + today[1].title + (today[1].isAllDay ? "" : " at " + short(today[1].startDate)) + ".");
+    parts.push(cap(e.title) + " " + short(eventWords(e, "today")) + ".");
+    if (today.length === 2) parts.push("One more after that: " + today[1].title + " " + short(eventWords(today[1], "all day")) + ".");
     else if (today.length > 2) parts.push((today.length - 1) + " more after that, ending with " + today[today.length - 1].title + ".");
   } else if (tom.length) {
-    parts.push("Nothing today. " + cap(tom[0].title) + " tomorrow" + (tom[0].isAllDay ? "" : " at " + short(tom[0].startDate)) + ".");
+    parts.push("Nothing today. " + cap(tom[0].title) + " " + short(tomorrowWords(tom[0])) + ".");
   } else {
     parts.push(remark(new Date().getHours() >= 18 ? "evening" : "empty"));
   }
@@ -1403,12 +1654,12 @@ function composeBrief(today, tom, due, headline, wx, extra, notes) {
 
 // Let him write it himself, in his own voice, at most once an hour.
 async function writeBrief(today, tom, due, headline, wx, extra, notes, changed) {
-  const short = t => niceTime(t).replace(/ in the (morning|afternoon|evening)/, "");
+  const words = (e, d) => eventWords(e, d).replace(/ in the (morning|afternoon|evening)/, "");
   const facts = [
     "Time of day greeting to use: " + greetingWord(),
     "Address him as: " + addressee(),
-    "Today: " + (today.length ? today.map(e => e.title + (e.isAllDay ? " (all day)" : " at " + short(e.startDate))).join("; ") : "nothing"),
-    "Tomorrow: " + (tom.length ? tom.map(e => e.title + (e.isAllDay ? " (all day)" : " at " + short(e.startDate))).join("; ") : "nothing"),
+    "Today: " + (today.length ? today.map(e => e.title + " " + words(e, "all day")).join("; ") : "nothing"),
+    "Tomorrow: " + (tom.length ? tom.map(e => e.title + " " + words(e, "all day")).join("; ") : "nothing"),
     "Reminders outstanding: " + (due.length ? due.map(r => r.title).join("; ") : "none"),
     headline ? "Top headline: " + headline : "No headline available",
     extra && extra.leave ? "Timing: " + extra.leave : "",
@@ -1496,6 +1747,10 @@ async function widget() {
   }
   if (!text) text = composeBrief(today, tom, size === "small" ? [] : due, headline, wx, extra, notes);
   if (size === "small") text = text.split(". ").slice(0, 2).join(". ") + (text.endsWith(".") ? "" : ".");
+  if (inQuietHours()) {                                                   // quiet hours: the greeting and one sentence
+    const s = text.split(". ");
+    text = s.slice(0, /^(Good|You're up)/.test(s[0]) ? 2 : 1).join(". ").replace(/\.?$/, ".");
+  }
   writeCache(cache);
 
   const body = w.addText(text);
