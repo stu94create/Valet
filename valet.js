@@ -860,15 +860,14 @@ async function onThisDayLine() {
   catch (e) { fault("On this day", e && e.message || e); return P.nothingOnThisDay; }
 }
 // A quiet day: nothing pressing in the diary, no more than one reminder,
-// the news thin, and nothing grave in the headlines. Only then is the
-// note offered, and only as one clause.
+// and nothing grave in the headlines. Only then is the note offered, and
+// only as one clause. The papers may be full; it is the diary that decides.
 const GRAVE = /\b(die|dies|died|death|deaths|dead|killed|killing|kills|murder|murdered|shot|stabbed|crash|crashes|funeral|suicide|massacre|bomb|bombing|war|attack|terror|hospitalised|cancer|missing|drowned|tragedy)\b/i;
 function quietDay(today, due, pick) {
   const pressing = (today || []).some(e => !e.isAllDay);
   const headlines = pick ? pick.items.concat(pick.extra ? [pick.extra] : []) : [];
-  const thin = headlines.length <= 2;
   const grave = headlines.some(i => GRAVE.test(i.title));
-  return !pressing && (due || []).length <= 1 && thin && !grave;
+  return !pressing && (due || []).length <= 1 && !grave;
 }
 // What the widget may use: a tray stocked in the last twelve hours, weather
 // from the last three. Older than that and it says nothing, quietly.
@@ -1617,7 +1616,7 @@ async function wentWrong() {
 const CHANGES = [
   "The widget no longer fetches anything. I stock the tray, papers and weather, when you open me, when you open the papers, when you ask me to read aloud, or when an automation runs me with the word refresh; the widget only reads what's there. Every paper is sent for at once, six seconds each, and the tray fills as they arrive.",
   "The newsagent says how many papers you take and how long the last full restocking took.",
-  "On a quiet day, with nothing pressing, no more than one reminder and thin papers, I may mention what happened on this day, once, and plainly. Ask me for something and I'll tell you regardless."
+  "On a quiet day, with nothing pressing in the diary and no more than one reminder, I may mention what happened on this day, once, and plainly. Ask me for something and I'll tell you regardless."
 ];
 const PAST = [
   { edition: "4.2", items: [
@@ -2024,7 +2023,7 @@ Flowing prose, no lists, no headings. Give two or three of the news items, from 
 
 If something is marked as changed since he last looked, lead with that rather than restating what he already knows. If you have been given things you noticed, work at most ONE of them in — the most telling — and leave the rest. An observation is worth more than another list of engagements.
 
-If you have been given an historical note, it is because the day is quiet: nothing pressing in the diary, no more than one reminder, the news thin. Give it as one clause, plainly, in the form "On this day in 1798, the French landed at Killala." Never as trivia, never "did you know", never more than one, and never beside a death or a grave matter.`;
+If you have been given an historical note, it is because the day is quiet: nothing pressing in the diary, no more than one reminder. Give it as one clause, plainly, in the form "On this day in 1798, the French landed at Killala." Never as trivia, never "did you know", never more than one, and never beside a death or a grave matter.`;
   const out = (await gemini(sys, facts, false)).trim();
   return size === "large" ? out.replace(/[ \t]+/g, " ").replace(/\s*\n\s*/g, "\n\n") : out.replace(/\s+/g, " ");
 }
