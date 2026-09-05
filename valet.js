@@ -247,7 +247,12 @@ function spanWords(e) {
   const df = new DateFormatter(); df.dateFormat = days > 7 ? "EEEE d MMMM" : "EEEE";
   return "until " + df.string(last);
 }
-function eventWords(e, dayWord) { return e.isAllDay ? (spanWords(e) || dayWord || "all day") : "at " + niceTime(e.startDate); }
+function eventWords(e, dayWord) {
+  if (e.isAllDay) return spanWords(e) || dayWord || "all day";
+  const now = new Date();
+  if (e.startDate <= now && e.endDate > now) return "now, until " + niceTime(e.endDate); // in progress, not upcoming
+  return "at " + niceTime(e.startDate);
+}
 function tomorrowWords(e) { return e.isAllDay ? (spanWords(e) ? "from tomorrow, " + spanWords(e) : "tomorrow") : "tomorrow at " + niceTime(e.startDate); }
 
 // ───────────────────────── Reminders, spoken ─────────────────────────
@@ -914,7 +919,7 @@ async function ringUp(who) {
 }
 async function readEvents(list, label) {
   if (!list.length) return await tell(`Nothing ${label}.`);
-  const lines = list.map(e => `${tidy(e.title)}${e.isAllDay ? (spanWords(e) ? ", " + spanWords(e) : "") : ", " + niceTime(e.startDate)}${label === "this week" ? " " + niceDay(e.startDate) : ""}`);
+  const lines = list.map(e => `${tidy(e.title)}${e.isAllDay ? (spanWords(e) ? ", " + spanWords(e) : "") : ", " + eventWords(e)}${label === "this week" ? " " + niceDay(e.startDate) : ""}`);
   await tell(`${cap(label)}: ${lines.join(". ")}.`);
 }
 
@@ -1382,6 +1387,7 @@ async function wentWrong() {
 }
 
 const CHANGES = [
+  "The widget keeps up. Every draw starts from the diary as it stands: nothing that has finished, and anything under way said as now. I ask the telephone to redraw at the moments that matter, and my written paragraph is dropped the instant it stops being true. It says when I last looked, so you know.",
   "Reminders are fuller: when they're due, in clock words; overdue said plainly; the list, when more than one is in play; the priority, when it's high. Tap one and I read it out, notes and all, and offer to tick it off or put it off until later today or tomorrow.",
   "Titles are tidied before I say them: a capital to start, and a space where a letter ran into a digit."
 ];
@@ -1736,6 +1742,7 @@ async function writeBrief(today, tom, due, headline, wx, extra, notes, changed) 
     extra && extra.battery ? "Battery: " + extra.battery : "",
     notes && notes.length ? "Things you have noticed:\n" + notes.map(n => "- " + n).join("\n") : "",
     changed ? "Changed since he last looked: " + changed : "",
+    today.some(e => /^now,/.test(words(e, ""))) ? "An engagement marked \"now\" is in progress: speak of it as happening, not as upcoming." : "",
     wx ? `Weather: ${wx.word || ""} ${wx.now}C, high ${wx.high}, low ${wx.low}${wx.rain != null ? ", chance of rain " + wx.rain + "%" : ""}${wx.sunset ? ", sunset " + niceTime(new Date(wx.sunset)).replace(/ in the (morning|afternoon|evening)/, "") : ""}` : "No weather available"
   ].join("\n");
   const sys = personaPrompt(addressee()) + `
@@ -1747,6 +1754,44 @@ Write ONE short paragraph to be read on a home screen widget: the greeting, then
 If something is marked as changed since he last looked, lead with that rather than restating what he already knows. If you have been given things you noticed, work at most ONE of them in — the most telling — and leave the rest. An observation is worth more than another list of engagements.`;
   return (await gemini(sys, facts, false)).trim().replace(/\s+/g, " ");
 }
+
+// ───────────────────────── Keeping the widget honest ─────────────────────────
+// What the facts are, in one string: every unfinished engagement with its
+// start and whether it is upcoming or under way, every reminder due with
+// its time, and the part of day. If any of it changes, the written
+// paragraph is stale and is not shown.
+function factsKey(today, due) {
+  const now = new Date();
+  const phase = e => e.isAllDay ? "day" : e.startDate > now ? "soon" : "now";
+  const ev = (today || []).map(e => `${e.title}@${e.startDate.getTime()}:${phase(e)}`).sort().join("|");
+  const rm = (due || []).map(r => `${r.title}@${r.dueDate ? r.dueDate.getTime() : 0}`).sort().join("|");
+  return ev + "#" + rm + "#" + dayPart();
+}
+// Only the facts as they stand: nothing that has ended, nothing from cache.
+async function liveFacts() {
+  const now = new Date();
+  let today = [], tom = [], due = [];
+  try { today = (await eventsToday()).filter(e => e.endDate > now); } catch (e) {}
+  try { tom = await eventsTomorrow(); } catch (e) {}
+  try { due = await remindersDue(); } catch (e) {}
+  return { today, tom, due };
+}
+// When iOS should next redraw: the earliest of the next engagement's start,
+// the current one's end, the next reminder due today, the next turn of the
+// day (5, 12, 18), or a quarter of an hour; never sooner than five minutes.
+function nextRedraw(today, tom, due) {
+  const now = Date.now(), soon = [now + 15 * 60 * 1000];
+  for (const e of [...(today || []), ...(tom || [])]) {
+    if (e.isAllDay) continue;
+    const s = e.startDate.getTime(), f = e.endDate.getTime();
+    if (s > now) soon.push(s + 30 * 1000);
+    else if (f > now) soon.push(f + 30 * 1000);
+  }
+  for (const r of due || []) if (reminderTimed(r) && r.dueDate.getTime() > now) soon.push(r.dueDate.getTime() + 30 * 1000);
+  for (const h of [5, 12, 18, 29]) { const d = new Date(); d.setHours(h, 0, 30, 0); if (d.getTime() > now) { soon.push(d.getTime()); break; } } // 29 = 5 tomorrow
+  return new Date(Math.max(Math.min(...soon), now + 5 * 60 * 1000));
+}
+function lookedAt() { const d = new Date(); return `Looked at ${pad(d.getHours())}:${pad(d.getMinutes())}.`; }
 
 async function widget() {
   const size = config.widgetFamily || "medium";
@@ -1760,10 +1805,7 @@ async function widget() {
     Script.setWidget(w); return;
   }
 
-  let today = [], tom = [], due = [];
-  try { today = (await eventsToday()).filter(e => e.endDate > new Date()); } catch (e) {}
-  try { tom = await eventsTomorrow(); } catch (e) {}
-  try { due = await remindersDue(); } catch (e) {}
+  const { today, tom, due } = await liveFacts();   // fresh every draw; nothing finished, nothing cached
 
   const cache = readCache();
   const wx = size === "small" ? null : await outlook();
@@ -1787,7 +1829,8 @@ async function widget() {
   }
   const headline = size === "small" ? null : cache.headline;
 
-  // The paragraph. His own words if he can manage it, hourly.
+  // The paragraph. His own words if he can manage it, for half an hour at
+  // most, and only while the facts it was written from still hold.
   let text = null;
   const notes = size === "small" ? [] : await noticings(today, tom, due);
 
@@ -1806,16 +1849,17 @@ async function widget() {
   }
   cache.state = state;
 
-  const sig = state + "#" + (headline || "") + "#" + dayPart() + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "") + "#" + notes.join("|");
-  const written = cache.briefAt && (Date.now() - new Date(cache.briefAt) < 3600 * 1000) && cache.briefSig === sig && cache.briefPart === dayPart();
+  const facts = factsKey(today, due);
+  const sig = facts + "#" + (headline || "") + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "") + "#" + notes.join("|");
+  const written = cache.briefAt && (Date.now() - new Date(cache.briefAt) < 30 * 60 * 1000) && cache.briefSig === sig;
   if (written && cache.brief) text = cache.brief;
   else if (size !== "small" && Keychain.contains("valet.gemini")) {
     try {
       text = await writeBrief(today, tom, due, headline, wx, extra, notes, changed);
-      cache.brief = text; cache.briefAt = new Date().toISOString(); cache.briefSig = sig; cache.briefPart = dayPart();
+      cache.brief = text; cache.briefAt = new Date().toISOString(); cache.briefSig = sig; cache.briefFacts = facts; cache.briefPart = dayPart();
     } catch (e) { text = null; }
   }
-  if (!text) text = composeBrief(today, tom, size === "small" ? [] : due, headline, wx, extra, notes);
+  if (!text) text = composeBrief(today, tom, size === "small" ? [] : due, headline, wx, extra, notes); // local, and never stale
   if (size === "small") text = text.split(". ").slice(0, 2).join(". ") + (text.endsWith(".") ? "" : ".");
   if (inQuietHours()) {                                                   // quiet hours: the greeting and one sentence
     const s = text.split(". ");
@@ -1840,8 +1884,11 @@ async function widget() {
     const r = readStack.addText("Read aloud");
     r.font = Font.mediumSystemFont(11); r.textOpacity = 0.7;
   }
+  // So a stale widget looks stale. Not part of what he reads aloud.
+  const looked = w.addText(lookedAt());
+  looked.font = Font.systemFont(10); looked.textOpacity = 0.35;
 
-  w.refreshAfterDate = new Date(Date.now() + 15 * 60 * 1000);
+  w.refreshAfterDate = nextRedraw(today, tom, due);
   Script.setWidget(w);
 }
 
@@ -1853,16 +1900,13 @@ if (config.runsInWidget) {
   await introduce(false);
   await home();
 } else if (args.queryParameters && args.queryParameters.read) {
-  // Tapped "Read aloud" on the widget: say the brief and withdraw.
+  // Tapped "Read aloud" on the widget: say the brief and withdraw. His
+  // written paragraph only if it is recent and still true; otherwise a
+  // fresh line from the facts as they stand.
   const cached = readCache();
-  let line = cached.brief;
-  if (!line) {
-    let td = [], tm = [], du = [];
-    try { td = (await eventsToday()).filter(e => e.endDate > new Date()); } catch (e) {}
-    try { tm = await eventsTomorrow(); } catch (e) {}
-    try { du = await remindersDue(); } catch (e) {}
-    line = composeBrief(td, tm, du, cached.headline, cached.wx, {}, await noticings(td, tm, du));
-  }
+  const { today: td, tom: tm, due: du } = await liveFacts();
+  const recent = cached.brief && cached.briefAt && (Date.now() - new Date(cached.briefAt) < 10 * 60 * 1000) && cached.briefFacts === factsKey(td, du);
+  const line = recent ? cached.brief : composeBrief(td, tm, du, cached.headline, cached.wx, {}, await noticings(td, tm, du));
   say(line);
   const a = new Alert(); a.message = line; a.addAction("Very good"); a.addAction("Go on then");
   if ((await a.present()) === 1) { await scheduleNotices(); await home(); }
