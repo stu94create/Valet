@@ -3,7 +3,7 @@
 // Add to Siri from the script's settings so "Hey Siri, <name>" opens him.
 // Optional: add a Scriptable widget and choose this script for a standing brief.
 
-const VERSION = "4.0";
+const VERSION = "4.1";
 
 // ───────────────────────── Phrase book ─────────────────────────
 const P = {
@@ -59,7 +59,9 @@ const P = {
   voiceGone: "My voice has deserted me. The telephone's own will have to do.",
   nothingWrong: "Nothing has gone wrong. I've made a note of the date.",
   changesIntro: "This edition, in brief.",
-  quietArranged: "Quiet hours arranged. I shall hold my tongue."
+  quietArranged: "Quiet hours arranged. I shall hold my tongue.",
+  putOff: w => `Put off until ${w}. It will keep; they always do.`,
+  leftIt: "Left where it was."
 };
 
 const DUTIES = [
@@ -247,6 +249,65 @@ function spanWords(e) {
 }
 function eventWords(e, dayWord) { return e.isAllDay ? (spanWords(e) || dayWord || "all day") : "at " + niceTime(e.startDate); }
 function tomorrowWords(e) { return e.isAllDay ? (spanWords(e) ? "from tomorrow, " + spanWords(e) : "tomorrow") : "tomorrow at " + niceTime(e.startDate); }
+
+// ───────────────────────── Reminders, spoken ─────────────────────────
+// Titles are tidied and no more: a capital to start, and a space where a
+// letter runs straight into a digit. What he says of a reminder: when it is
+// due, in clock words; overdue, said plainly; which list, when more than one
+// is in play; the priority, only if high. Notes are kept for the tap.
+function tidy(s) { return cap(String(s || "").trim().replace(/([A-Za-z])(\d)/g, "$1 $2")); }
+function clockWords(d) {
+  const h = d.getHours(), m = d.getMinutes(), hr = x => String(x % 12 || 12);
+  const period = h < 12 ? " in the morning" : h < 18 ? " in the afternoon" : " in the evening";
+  if (m === 0) return `${hr(h)} o'clock${period}`;
+  if (m === 15) return `quarter past ${hr(h)}${period}`;
+  if (m === 30) return `half past ${hr(h)}${period}`;
+  if (m === 45) return `quarter to ${hr(h + 1)}${period}`;
+  return m < 30 ? `${m} past ${hr(h)}${period}` : `${60 - m} to ${hr(h + 1)}${period}`;
+}
+function reminderTimed(r) {
+  if (!r.dueDate) return false;
+  if (typeof r.dueDateIncludesTime === "boolean") return r.dueDateIncludesTime;
+  return !!(r.dueDate.getHours() || r.dueDate.getMinutes());
+}
+function dueWords(r) {
+  if (!r.dueDate) return "no date set";
+  const d = new Date(r.dueDate), now = new Date(), timed = reminderTimed(r);
+  const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+  if (timed && d < now) return sameDay(d, now) ? `overdue, was due ${clockWords(d)}` : `overdue since ${niceDay(d)}`;
+  if (!timed && d < dayStart) return `overdue since ${niceDay(d)}`;
+  if (sameDay(d, now)) return timed ? `due ${clockWords(d)}` : "due today";
+  return timed ? `due ${niceDay(d)} at ${clockWords(d)}` : `due ${niceDay(d)}`;
+}
+function highPriority(r) { return typeof r.priority === "number" && r.priority >= 1 && r.priority <= 4; }
+function listsOf(rs) { const s = new Set(); for (const r of rs || []) if (r.calendar && r.calendar.title) s.add(r.calendar.title); return s; }
+// The line beneath a reminder: due, the list if it matters, the priority if high.
+function reminderDetail(r, lists) {
+  const bits = [dueWords(r)];
+  if (lists && lists.size > 1 && r.calendar && r.calendar.title) bits.push(r.calendar.title);
+  if (highPriority(r)) bits.push("high priority");
+  return bits.join(", ");
+}
+function reminderWords(r, lists) { return `${tidy(r.title)}, ${reminderDetail(r, lists)}`; }
+// Tapping a reminder: he reads it out, notes and all, and offers to tick it
+// off or put it off. Nothing happens without a tap on the answer.
+async function attend(r) {
+  const title = tidy(r.title), due = dueWords(r);
+  const a = new Alert(); a.title = title;
+  a.message = cap(due) + "." + (highPriority(r) ? " High priority." : "") + (r.notes ? "\n\n" + r.notes : "");
+  say(`${title}, ${due}.`);
+  a.addAction("Tick it off"); a.addAction("Later today"); a.addAction("Tomorrow"); a.addCancelAction("Leave it");
+  const i = await a.present();
+  if (i === 0) { r.isCompleted = true; r.save(); say(P.done); }
+  else if (i === 1) {
+    const d = new Date(Date.now() + 3 * 3600 * 1000); d.setMinutes(Math.round(d.getMinutes() / 5) * 5, 0, 0); // to the nearest five minutes
+    r.dueDate = d; r.dueDateIncludesTime = true; r.save(); say(P.putOff(clockWords(d)));
+  } else if (i === 2) {
+    const d = new Date(); d.setDate(d.getDate() + 1);
+    if (reminderTimed(r)) { const t = new Date(r.dueDate); d.setHours(t.getHours(), t.getMinutes(), 0, 0); } else d.setHours(9, 0, 0, 0);
+    r.dueDate = d; r.dueDateIncludesTime = true; r.save(); say(P.putOff("tomorrow, " + clockWords(d)));
+  } else say(P.leftIt);
+}
 // Pulls a date and time out of plain words. Returns {date, hasTime, rest}.
 function parseWhen(text) {
   let t = " " + text.toLowerCase() + " ", d = new Date(), hasTime = false, found = false;
@@ -474,10 +535,11 @@ async function context(history) {
   const items = [];
   items.push(`Today is ${new Date().toString()}.`);
   try {
-    const today = (await eventsToday()).map(e => `${e.title} ${eventWords(e, "all day")}`);
-    const due = (await remindersDue()).map(r => r.title);
+    const today = (await eventsToday()).map(e => `${tidy(e.title)} ${eventWords(e, "all day")}`);
+    const dueList = await remindersDue(), lists = listsOf(dueList);
+    const due = dueList.map(r => reminderWords(r, lists));
     items.push((today.length ? "Today's diary: " + today.join("; ") + "." : "Nothing in today's diary.") + (due.length ? " Reminders due: " + due.join("; ") + "." : ""));
-    const tom = (await eventsTomorrow()).map(e => `${e.title} ${eventWords(e, "all day")}`);
+    const tom = (await eventsTomorrow()).map(e => `${tidy(e.title)} ${eventWords(e, "all day")}`);
     if (tom.length) items.push("Tomorrow: " + tom.join("; ") + ".");
   } catch (e) {}
   if (history) items.push("The conversation so far:\n" + history);
@@ -588,14 +650,14 @@ async function brief() {
   const today = (await eventsToday()).filter(e => e.endDate > new Date());
   if (today.length) {
     const e = today[0];
-    parts.push(`${e.title} ${eventWords(e, "today")}.` + (today.length > 1 ? ` ${today.length - 1} more after that.` : ""));
+    parts.push(`${tidy(e.title)} ${eventWords(e, "today")}.` + (today.length > 1 ? ` ${today.length - 1} more after that.` : ""));
   } else {
     const tom = await eventsTomorrow();
-    if (tom.length) parts.push(`${tom[0].title} ${tomorrowWords(tom[0])}.`);
+    if (tom.length) parts.push(`${tidy(tom[0].title)} ${tomorrowWords(tom[0])}.`);
     else parts.push(h < 18 ? P.nothingToday : P.quiet);
   }
   const due = await remindersDue();
-  if (due.length) parts.push(P.remindersDue(due.length) + (due.length === 1 ? ` ${cap(due[0].title)}.` : ""));
+  if (due.length) parts.push(P.remindersDue(due.length) + (due.length === 1 ? ` ${reminderWords(due[0], listsOf(due))}.` : ""));
   if (h >= 6 && h < 12 && S.feeds.length) parts.push(P.papersOnTray);
   return { text: parts.join(" "), today, due };
 }
@@ -743,7 +805,7 @@ async function scheduleNotices() {
     if (S.notices.news) for (const off of [0, 1]) mk(`valet.news.${off}`, P.newsNotice, at(S.notices.news, off));
     if (S.notices.half) {
       const evs = [...(await eventsToday()), ...(await eventsTomorrow())].filter(e => !e.isAllDay);
-      evs.slice(0, 12).forEach((e, i) => mk(`valet.half.${i}`, P.theHalf(e.title), new Date(e.startDate.getTime() - 30 * 60 * 1000)));
+      evs.slice(0, 12).forEach((e, i) => mk(`valet.half.${i}`, P.theHalf(tidy(e.title)), new Date(e.startDate.getTime() - 30 * 60 * 1000)));
     }
   } catch (e) {}
 }
@@ -852,7 +914,7 @@ async function ringUp(who) {
 }
 async function readEvents(list, label) {
   if (!list.length) return await tell(`Nothing ${label}.`);
-  const lines = list.map(e => `${e.title}${e.isAllDay ? (spanWords(e) ? ", " + spanWords(e) : "") : ", " + niceTime(e.startDate)}${label === "this week" ? " " + niceDay(e.startDate) : ""}`);
+  const lines = list.map(e => `${tidy(e.title)}${e.isAllDay ? (spanWords(e) ? ", " + spanWords(e) : "") : ", " + niceTime(e.startDate)}${label === "this week" ? " " + niceDay(e.startDate) : ""}`);
   await tell(`${cap(label)}: ${lines.join(". ")}.`);
 }
 
@@ -944,9 +1006,10 @@ async function home() {
     const leave = await leaveBy(b.today);
     if (soon || leave || b.due.length) {
       table.addRow(headerRow("What requires you"));
-      if (soon) table.addRow(infoRow(soon.title, cap(niceTime(soon.startDate))));
+      if (soon) table.addRow(infoRow(tidy(soon.title), cap(niceTime(soon.startDate))));
       if (leave) table.addRow(infoRow(leave));
-      b.due.forEach(r => table.addRow(actionRow(r.title, "Due today. Tap to tick it off", () => { action = async () => { r.isCompleted = true; r.save(); say(P.done); }; })));
+      const lists = listsOf(b.due);
+      b.due.forEach(r => table.addRow(actionRow(tidy(r.title), cap(reminderDetail(r, lists)), () => { action = () => attend(r); })));
     }
 
     // He is observant, not insistent: the fuller phrasing at most once a day, and only when sure.
@@ -1022,8 +1085,8 @@ async function diaryTable() {
   let next = null;
   table.addRow(row("Make an entry", "Say what and when", () => { next = async () => { const a = new Alert(); a.title = "An entry"; a.addTextField("Dentist Tuesday at 2", ""); a.addAction("Note it"); a.addCancelAction("Never mind"); if ((await a.present()) === 0) await handle("add " + a.textFieldValue(0)); }; }));
   const when = e => `${cap(niceDay(e.startDate))}${e.isAllDay ? (spanWords(e) ? ", " + spanWords(e) : "") : ", " + niceTime(e.startDate)}`;
-  list.forEach(e => table.addRow(row(e.title, when(e), () => { next = async () => {
-    const a = new Alert(); a.title = e.title; a.message = when(e); a.addDestructiveAction("Strike it out"); a.addCancelAction("Leave it");
+  list.forEach(e => table.addRow(row(tidy(e.title), when(e), () => { next = async () => {
+    const a = new Alert(); a.title = tidy(e.title); a.message = when(e); a.addDestructiveAction("Strike it out"); a.addCancelAction("Leave it");
     if ((await a.present()) === 0) { e.remove(); say(P.struck); }
   }; })));
   await table.present(false); if (next) await next();
@@ -1032,10 +1095,11 @@ async function diaryTable() {
 async function remindersTable() {
   const all = (await Reminder.allIncomplete()).sort((a, b) => (a.dueDate || 0) - (b.dueDate || 0)).slice(0, 25);
   const table = new UITable(); table.showSeparators = true;
-  table.addRow(row(all.length ? "Outstanding. Tap one to tick it off, and I shall pretend not to be surprised." : P.remindersEmpty, null, null));
+  table.addRow(row(all.length ? "Outstanding. Tap one to tick it off or put it off, and I shall pretend not to be surprised." : P.remindersEmpty, null, null));
   let next = null;
   table.addRow(row("Add one", null, () => { next = async () => { const a = new Alert(); a.title = "Not to be forgotten"; a.addTextField("Invoice the accountant on Friday", ""); a.addAction("Note it"); a.addCancelAction("Never mind"); if ((await a.present()) === 0) await handle("remind me to " + a.textFieldValue(0)); }; }));
-  all.forEach(r => table.addRow(row(r.title, r.dueDate ? cap(niceDay(r.dueDate)) : null, () => { next = async () => { r.isCompleted = true; r.save(); say(P.done); }; })));
+  const lists = listsOf(all);
+  all.forEach(r => table.addRow(row(tidy(r.title), cap(reminderDetail(r, lists)), () => { next = () => attend(r); })));
   await table.present(false); if (next) await next();
 }
 
@@ -1318,6 +1382,10 @@ async function wentWrong() {
 }
 
 const CHANGES = [
+  "Reminders are fuller: when they're due, in clock words; overdue said plainly; the list, when more than one is in play; the priority, when it's high. Tap one and I read it out, notes and all, and offer to tick it off or put it off until later today or tomorrow.",
+  "Titles are tidied before I say them: a capital to start, and a space where a letter ran into a digit."
+];
+const PAST_CHANGES = [
   "Nothing about you lives in the script any more. Tell me about the household below stairs and I'll write accordingly; say nothing and I'll assume nothing.",
   "The front door is in order: my briefing, then what requires you, then one suggestion, then three ways of asking me, then the household.",
   "I weigh recent habits over old ones, keep weekdays apart from weekends, and won't suggest what you've only just had.",
@@ -1330,6 +1398,8 @@ async function whatsChanged() {
   const table = new UITable(); table.showSeparators = true;
   table.addRow(infoRow(`${P.changesIntro} Edition ${VERSION}.`));
   CHANGES.forEach(c => table.addRow(infoRow(c)));
+  table.addRow(headerRow("Edition 4.0"));
+  PAST_CHANGES.forEach(c => table.addRow(infoRow(c)));
   await table.present(false);
 }
 
@@ -1443,7 +1513,7 @@ async function leaveBy(events) {
     if (d < 0.4) return "";
     const travel = Math.max(5, Math.round(d / 40 * 60) + 5); // rough road time, plus a margin
     const spare = mins - travel;
-    if (spare <= 0) return "You are already late for " + e.title + ".";
+    if (spare <= 0) return "You are already late for " + tidy(e.title) + ".";
     if (spare <= 30) return "You'll want to leave in about " + spare + " minutes.";
     return "";
   } catch (e) { return ""; }
@@ -1470,7 +1540,7 @@ async function countdowns() {
     const evs = await CalendarEvent.between(from, to);
     for (const e of evs) {
       const d = daysUntil(e.startDate);
-      if (d >= 2 && (d <= 30 || [45, 60, 90, 100].includes(d))) out.push({ title: e.title, days: d });
+      if (d >= 2 && (d <= 30 || [45, 60, 90, 100].includes(d))) out.push({ title: tidy(e.title), days: d });
     }
   } catch (e) {}
   // Only the nearest few, and only ones worth mentioning: a round number or close.
@@ -1499,7 +1569,7 @@ function staleReminders(due) {
   for (const r of due || []) {
     if (!r.creationDate) continue;
     const age = Math.round((Date.now() - new Date(r.creationDate)) / 86400000);
-    if (age >= 7) out.push({ title: r.title, days: age });
+    if (age >= 7) out.push({ title: tidy(r.title), days: age });
   }
   return out.sort((a, b) => b.days - a.days).slice(0, 1);
 }
@@ -1515,7 +1585,7 @@ async function patterns(today, tom) {
       const first = new Date(); first.setDate(1); first.setHours(0,0,0,0);
       const month = await CalendarEvent.between(first, new Date());
       const same = month.filter(e => e.title.toLowerCase() === today[0].title.toLowerCase()).length;
-      if (same >= 3) out.push(`That's the ${same === 3 ? "third" : same === 4 ? "fourth" : same + "th"} ${today[0].title} this month.`);
+      if (same >= 3) out.push(`That's the ${same === 3 ? "third" : same === 4 ? "fourth" : same + "th"} ${tidy(today[0].title)} this month.`);
     }
   } catch (e) {}
   return out;
@@ -1627,19 +1697,19 @@ function composeBrief(today, tom, due, headline, wx, extra, notes) {
   const parts = [greetingWord() + ", " + addressee() + "."];
   const short = s => s.replace(/ in the (morning|afternoon|evening)/, "");
   if (dayPart() === "evening" && tom.length) {
-    parts.push("That's the day. " + cap(tom[0].title) + " " + short(tomorrowWords(tom[0])) + ".");
+    parts.push("That's the day. " + tidy(tom[0].title) + " " + short(tomorrowWords(tom[0])) + ".");
   } else if (today.length) {
     const e = today[0];
-    parts.push(cap(e.title) + " " + short(eventWords(e, "today")) + ".");
-    if (today.length === 2) parts.push("One more after that: " + today[1].title + " " + short(eventWords(today[1], "all day")) + ".");
-    else if (today.length > 2) parts.push((today.length - 1) + " more after that, ending with " + today[today.length - 1].title + ".");
+    parts.push(tidy(e.title) + " " + short(eventWords(e, "today")) + ".");
+    if (today.length === 2) parts.push("One more after that: " + tidy(today[1].title) + " " + short(eventWords(today[1], "all day")) + ".");
+    else if (today.length > 2) parts.push((today.length - 1) + " more after that, ending with " + tidy(today[today.length - 1].title) + ".");
   } else if (tom.length) {
-    parts.push("Nothing today. " + cap(tom[0].title) + " " + short(tomorrowWords(tom[0])) + ".");
+    parts.push("Nothing today. " + tidy(tom[0].title) + " " + short(tomorrowWords(tom[0])) + ".");
   } else {
     parts.push(remark(new Date().getHours() >= 18 ? "evening" : "empty"));
   }
-  if (due.length === 1) parts.push("One reminder outstanding: " + due[0].title + ".");
-  else if (due.length > 1) parts.push(due.length + " reminders outstanding, " + due[0].title + " among them.");
+  if (due.length === 1) parts.push("One reminder outstanding: " + short(reminderWords(due[0], listsOf(due))) + ".");
+  else if (due.length > 1) parts.push(due.length + " reminders outstanding, " + tidy(due[0].title) + " among them.");
   if (notes && notes.length) parts.push(notes[0]);
   if (extra && extra.leave) parts.push(extra.leave);
   const wl = weatherLine(wx); if (wl) parts.push(wl);
@@ -1658,9 +1728,9 @@ async function writeBrief(today, tom, due, headline, wx, extra, notes, changed) 
   const facts = [
     "Time of day greeting to use: " + greetingWord(),
     "Address him as: " + addressee(),
-    "Today: " + (today.length ? today.map(e => e.title + " " + words(e, "all day")).join("; ") : "nothing"),
-    "Tomorrow: " + (tom.length ? tom.map(e => e.title + " " + words(e, "all day")).join("; ") : "nothing"),
-    "Reminders outstanding: " + (due.length ? due.map(r => r.title).join("; ") : "none"),
+    "Today: " + (today.length ? today.map(e => tidy(e.title) + " " + words(e, "all day")).join("; ") : "nothing"),
+    "Tomorrow: " + (tom.length ? tom.map(e => tidy(e.title) + " " + words(e, "all day")).join("; ") : "nothing"),
+    "Reminders outstanding: " + (due.length ? due.map(r => reminderWords(r, listsOf(due))).join("; ") : "none"),
     headline ? "Top headline: " + headline : "No headline available",
     extra && extra.leave ? "Timing: " + extra.leave : "",
     extra && extra.battery ? "Battery: " + extra.battery : "",
