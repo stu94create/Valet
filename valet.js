@@ -3,7 +3,7 @@
 // Add to Siri from the script's settings so "Hey Siri, <name>" opens him.
 // Optional: add a Scriptable widget and choose this script for a standing brief.
 
-const VERSION = "2.7";
+const VERSION = "3.1";
 
 // ───────────────────────── Phrase book ─────────────────────────
 const P = {
@@ -42,6 +42,8 @@ const P = {
   briefNotice: "Your brief is ready. It has been for some time.",
   newsNotice: "The papers have arrived. Nothing has improved.",
   arranged: "Arranged. I'll remind you, since I'm the one who remembers.",
+  opmlNone: "There's nothing subscribable in that file.",
+  opmlTaken: n => n === 1 ? "One more paper taken." : `${n} more papers taken. Ambitious.`,
   remembered: "Noted, and I shan't forget it. Unlike some.",
   forgotten: "Forgotten. It never happened.",
   journalEmpty: "You've told me nothing worth keeping. Yet.",
@@ -75,6 +77,17 @@ const DEFAULT_APPS = [
   { n: "Amazon", u: "https://www.amazon.co.uk", d: "errands" },
   { n: "Revolut", u: "revolut://", d: "errands" },
   { n: "Just Eat", u: "justeat://", d: "errands" }
+];
+
+// The papers he takes by default. Any RSS or Atom feed will do; edit or add
+// below stairs, or import an OPML file from Lire, Overcast and the like.
+// "tag" marks feeds worth flagging for the podcast when he writes the brief.
+const DEFAULT_FEEDS = [
+  { n: "RTÉ News", u: "https://www.rte.ie/news/rss/news-headlines.xml" },
+  { n: "The Irish Times", u: "https://www.irishtimes.com/arc/outboundfeeds/rss/" },
+  { n: "BBC News", u: "https://feeds.bbci.co.uk/news/rss.xml" },
+  { n: "AppleVis", u: "https://www.applevis.com/rss.xml", tag: "tech" },
+  { n: "Blind Bargains", u: "https://www.blindbargains.com/bbfeed.php", tag: "tech" }
 ];
 
 // Name of the Shortcut that sends a WhatsApp message. It should accept text
@@ -509,7 +522,9 @@ async function fetchPapers() { return await Promise.all(S.feeds.map(fetchPaper))
 
 // A short spoken form: "From RTÉ: a, b, c."
 function papersSpeech(papers) {
-  const bits = papers.filter(p => p.items.length).map(p => `${P.papersFrom(p.paper.n)} ${p.items.map(i => i.title).join(". ")}.`);
+  const bits = papers.filter(p => p.items.length).map(p => p.paper.kind === "podcast"
+    ? `New from ${p.paper.n}: ${p.items.map(i => i.title).join(". ")}.`
+    : `${P.papersFrom(p.paper.n)} ${p.items.map(i => i.title).join(". ")}.`);
   return bits.length ? bits.join(" ") + " " + P.papersDone : P.papersEmpty;
 }
 
@@ -547,6 +562,62 @@ async function papersInner(spokenOnly) {
     p.items.forEach(i => table.addRow(row(i.title, i.summary || null, () => { next = () => Safari.open(i.link); })));
   });
   await table.present(false); if (next) await next();
+}
+
+
+// ───────────────────────── Taking more papers ─────────────────────────
+// OPML is what Lire, Overcast, Pocket Casts and the rest export. It's a list
+// of feeds; he reads the names and addresses out of it and lets you choose.
+function parseOPML(xml) {
+  const out = [];
+  const outlines = xml.match(/<outline\b[^>]*\/?>/g) || [];
+  for (const o of outlines) {
+    const url = (o.match(/xmlUrl\s*=\s*"([^"]+)"/i) || o.match(/xmlUrl\s*=\s*'([^']+)'/i) || [])[1];
+    if (!url) continue;
+    let name = (o.match(/\btext\s*=\s*"([^"]*)"/i) || o.match(/\btitle\s*=\s*"([^"]*)"/i) || [])[1] || url;
+    const type = ((o.match(/\btype\s*=\s*"([^"]*)"/i) || [])[1] || "").toLowerCase();
+    out.push({ n: decode(name), u: decode(url), kind: type === "podcast" ? "podcast" : "" });
+  }
+  // Same feed twice in one file is common; keep the first.
+  const seen = {};
+  return out.filter(f => (seen[f.u] ? false : (seen[f.u] = true)));
+}
+
+async function importOPML() {
+  let paths = [];
+  try { paths = await DocumentPicker.open(["public.xml", "public.text", "public.data"]); }
+  catch (e) { return; }
+  if (!paths || !paths.length) return;
+  let xml = "";
+  try { xml = fm.readString(paths[0]); } catch (e) { return await tell("I couldn't read that file."); }
+  const found = parseOPML(xml);
+  if (!found.length) return await tell(P.opmlNone);
+
+  // Anything already taken is marked so, and can't be taken twice.
+  const chosen = {};
+  let done = false, added = 0;
+  while (!done) {
+    const table = new UITable(); table.showSeparators = true;
+    const pending = found.filter(f => chosen[f.u]).length;
+    table.addRow(row(`${found.length} feeds in that file. Tap to choose; tap again to change your mind.`, pending ? `${pending} chosen` : null, null));
+    let act = null;
+    if (pending) table.addRow(row(`Take the ${pending} chosen`, null, () => { act = "take"; }));
+    table.addRow(row("Take all of them", null, () => { act = "all"; }));
+    found.forEach(f => {
+      const have = S.feeds.some(x => x.u === f.u);
+      table.addRow(row((chosen[f.u] ? "✓ " : "") + f.n, have ? "Already taken" : (f.kind === "podcast" ? "Podcast" : f.u.replace(/^https?:\/\//, "").slice(0, 40)), have ? null : () => { act = f; }));
+    });
+    await table.present(false);
+    if (!act) return;                                  // dismissed
+    if (act === "all") { found.forEach(f => { if (!S.feeds.some(x => x.u === f.u)) chosen[f.u] = f; }); act = "take"; }
+    if (act === "take") {
+      for (const u in chosen) { S.feeds.push(chosen[u]); added++; }
+      save(); done = true;
+    } else {
+      if (chosen[act.u]) delete chosen[act.u]; else chosen[act.u] = act;
+    }
+  }
+  if (added) await tell(P.opmlTaken(added));
 }
 
 // ───────────────────────── Notices ─────────────────────────
@@ -935,8 +1006,9 @@ async function newsagent() {
   const table = new UITable(); table.showSeparators = true;
   table.addRow(row("The papers he takes. Any RSS or Atom feed will do — most news sites have one.", null, null));
   let next = null;
-  table.addRow(row("Take another paper", null, () => { next = () => editFeed(null); }));
-  S.feeds.forEach(f => table.addRow(row(f.n, f.tag ? "Flagged for the podcast" : null, () => { next = () => editFeed(f); })));
+  table.addRow(row("Take another paper", "One address at a time", () => { next = () => editFeed(null); }));
+  table.addRow(row("Import a list", "An OPML file from Lire, Overcast or similar", () => { next = importOPML; }));
+  S.feeds.forEach(f => table.addRow(row(f.n, [f.kind === "podcast" ? "Podcast" : null, f.tag ? "Flagged for the podcast" : null].filter(Boolean).join(" · ") || null, () => { next = () => editFeed(f); })));
   await table.present(false); if (next) await next();
 }
 async function editFeed(f) {
@@ -949,6 +1021,7 @@ async function editFeed(f) {
     const n = al.textFieldValue(0).trim(), u = al.textFieldValue(1).trim(), tag = al.textFieldValue(2).trim().toLowerCase() || undefined;
     if (!n || !u) return;
     if (f) { f.n = n; f.u = u; f.tag = tag; } else S.feeds.push({ n, u, tag });
+    if (f && /podcast|episode/i.test(tag || "")) f.kind = "podcast";
     save(); say("Very good.");
   } else if (f && i === 1) { S.feeds = S.feeds.filter(x => x !== f); save(); say("Cancelled."); }
 }
@@ -1152,6 +1225,136 @@ function distanceKm(a1, o1, a2, o2) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
+
+// ───────────────────────── What he notices ─────────────────────────
+// Facts the brief can use when they earn a place, and stay quiet about
+// otherwise. Countdowns, birthdays, things going stale, patterns in the
+// diary, and hours from his records.
+function daysUntil(d) { const t = new Date(); t.setHours(0,0,0,0); const x = new Date(d); x.setHours(0,0,0,0); return Math.round((x - t) / 86400000); }
+
+// Anything in the diary far enough ahead to be worth counting down to.
+async function countdowns() {
+  const out = [];
+  try {
+    const from = new Date(), to = new Date(); to.setDate(from.getDate() + 120);
+    const evs = await CalendarEvent.between(from, to);
+    for (const e of evs) {
+      const d = daysUntil(e.startDate);
+      if (d >= 2 && (d <= 30 || [45, 60, 90, 100].includes(d))) out.push({ title: e.title, days: d });
+    }
+  } catch (e) {}
+  // Only the nearest few, and only ones worth mentioning: a round number or close.
+  return out.sort((a, b) => a.days - b.days).filter(c => c.days <= 14 || c.days % 10 === 0).slice(0, 2);
+}
+
+async function birthdaysSoon() {
+  const out = [];
+  try {
+    if (!contactCache) { const cs = await ContactsContainer.all(); contactCache = await Contact.all(cs); }
+    const now = new Date();
+    for (const c of contactCache) {
+      const b = c.birthday; if (!b) continue;
+      const d = new Date(b); const next = new Date(now.getFullYear(), d.getMonth(), d.getDate());
+      if (next < new Date(now.getFullYear(), now.getMonth(), now.getDate())) next.setFullYear(now.getFullYear() + 1);
+      const days = daysUntil(next);
+      if (days <= 7) out.push({ name: (c.givenName || "").trim() || (c.familyName || ""), days });
+    }
+  } catch (e) {}
+  return out.sort((a, b) => a.days - b.days).slice(0, 2);
+}
+
+// Reminders that have been sitting there a while.
+function staleReminders(due) {
+  const out = [];
+  for (const r of due || []) {
+    if (!r.creationDate) continue;
+    const age = Math.round((Date.now() - new Date(r.creationDate)) / 86400000);
+    if (age >= 7) out.push({ title: r.title, days: age });
+  }
+  return out.sort((a, b) => b.days - a.days).slice(0, 1);
+}
+
+// Patterns worth a remark: empty stretches, a recurring engagement's tally.
+async function patterns(today, tom) {
+  const out = [];
+  try {
+    const back = new Date(); back.setDate(back.getDate() - 3);
+    const recent = await CalendarEvent.between(back, new Date());
+    if (!recent.length && !today.length && !tom.length) out.push("Nothing in the diary for three days running.");
+    if (today.length) {
+      const first = new Date(); first.setDate(1); first.setHours(0,0,0,0);
+      const month = await CalendarEvent.between(first, new Date());
+      const same = month.filter(e => e.title.toLowerCase() === today[0].title.toLowerCase()).length;
+      if (same >= 3) out.push(`That's the ${same === 3 ? "third" : same === 4 ? "fourth" : same + "th"} ${today[0].title} this month.`);
+    }
+  } catch (e) {}
+  return out;
+}
+
+// Hours from a Timesheet backup, if one is in his records.
+// The app keeps a week per key, dated to that week's Monday, each holding
+// entries of {day, task, time}. The weekly cap is effective-dated in mxh:
+// an ascending list of {from, max}, so past weeks keep the cap they were
+// logged under. Backups may be a flat object of those keys or wrap them.
+function mondayKey(d) {
+  const x = new Date(d), day = x.getDay();
+  x.setDate(x.getDate() - day + (day === 0 ? -6 : 1));
+  x.setHours(0, 0, 0, 0);
+  return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`;
+}
+function capAt(mxh, key) {
+  let m = Array.isArray(mxh) && mxh.length ? mxh[0].max : 7;
+  for (const p of (mxh || [])) { if (p && p.from <= key) m = p.max; else break; }
+  return m;
+}
+function findTimesheet() {
+  try {
+    for (const f of fm.listContents(projectsDir)) {
+      const p = fm.joinPath(projectsDir, f);
+      try { fm.downloadFileFromiCloud(p); } catch (e) {}
+      let obj; try { obj = JSON.parse(fm.readString(p)); } catch (e) { continue; }
+      // Find the week map wherever it sits.
+      const isWeekMap = o => o && typeof o === "object" && Object.keys(o).some(k => /^\d{4}-\d{2}-\d{2}$/.test(k) && Array.isArray(o[k]));
+      let weeks = null;
+      if (isWeekMap(obj)) weeks = obj;
+      else for (const k of Object.keys(obj)) { if (isWeekMap(obj[k])) { weeks = obj[k]; break; } }
+      if (!weeks) continue;
+      const mxh = obj.mxh || (obj.settings && obj.settings.mxh) || null;
+      return { weeks, mxh, cap: obj.mx || (obj.settings && obj.settings.mx) || null };
+    }
+  } catch (e) {}
+  return null;
+}
+function timesheetWeek() {
+  const ts = findTimesheet();
+  if (!ts) return null;
+  const key = mondayKey(new Date());
+  const entries = ts.weeks[key];
+  if (!Array.isArray(entries)) return null;
+  const sum = list => Math.round(list.reduce((a, e) => a + (parseFloat(e.time) || 0), 0) * 10) / 10;
+  const logged = sum(entries);
+  const cap = capAt(ts.mxh, key) || ts.cap || 7;
+  const off = sum(entries.filter(e => e.task === "Time Off"));
+  const sick = sum(entries.filter(e => e.task === "Sick Leave"));
+  return { logged, cap, claimed: Math.min(logged, cap), owing: Math.max(0, logged - cap), off, sick, entries: entries.length };
+}
+// Everything he's noticed, as short plain sentences for the writer.
+async function noticings(today, tom, due) {
+  const bits = [];
+  for (const c of await countdowns()) bits.push(`${c.days} days until ${c.title}.`);
+  for (const b of await birthdaysSoon()) bits.push(b.days === 0 ? `${b.name}'s birthday is today.` : b.days === 1 ? `${b.name}'s birthday is tomorrow.` : `${b.name}'s birthday in ${b.days} days.`);
+  for (const s of staleReminders(due)) bits.push(`The reminder "${s.title}" has been there ${s.days} days.`);
+  for (const p of await patterns(today, tom)) bits.push(p);
+  const hw = timesheetWeek();
+  if (hw && hw.entries) {
+    if (hw.owing > 0) bits.push(`${hw.logged} hours logged this week against a ${hw.cap}-hour cap: ${hw.owing} owing.`);
+    else if (hw.logged >= hw.cap) bits.push(`${hw.logged} hours logged this week — the ${hw.cap} is used up.`);
+    else bits.push(`${hw.logged} of ${hw.cap} hours logged this week.`);
+    if (hw.sick > 0) bits.push(`${hw.sick} hours of sick leave this week.`);
+  }
+  return bits;
+}
+
 // ───────────────────────── Widget ─────────────────────────
 // One paragraph, in his voice: greeting, the day, what's outstanding,
 // a headline, and a dry remark to finish. Written by him if the thinking
@@ -1161,6 +1364,17 @@ function greetingWord() {
   const h = new Date().getHours();
   return h < 5 ? "You're up late" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
 }
+// Three briefs, not one repeated: what's ahead, where you are, how it went.
+function dayPart() {
+  const h = new Date().getHours();
+  return h < 5 ? "night" : h < 12 ? "morning" : h < 18 ? "midday" : "evening";
+}
+const SHAPE = {
+  morning: "This is the morning brief: what is ahead of him today. Lead with the first engagement and what he must not forget.",
+  midday: "This is the midday check: where he stands. Lead with what is left of the day and anything slipping — say what remains rather than repeating what is done.",
+  evening: "This is the evening note: how the day went and what is first tomorrow. Speak of today in the past tense. Do not list today's engagements again.",
+  night: "It is the small hours. Keep it to one or two sentences: what is first when he wakes, and nothing else."
+};
 
 // A remark for a quiet moment. Picked by the day so it doesn't change every refresh.
 const REMARKS = {
@@ -1179,10 +1393,12 @@ function remark(kind) {
 }
 
 // Assemble the paragraph without help.
-function composeBrief(today, tom, due, headline, wx, extra) {
+function composeBrief(today, tom, due, headline, wx, extra, notes) {
   const parts = [greetingWord() + ", " + addressee() + "."];
   const short = t => niceTime(t).replace(/ in the (morning|afternoon|evening)/, "");
-  if (today.length) {
+  if (dayPart() === "evening" && tom.length) {
+    parts.push("That's the day. " + cap(tom[0].title) + " tomorrow" + (tom[0].isAllDay ? "" : " at " + short(tom[0].startDate)) + ".");
+  } else if (today.length) {
     const e = today[0];
     parts.push(cap(e.title) + (e.isAllDay ? " today" : " at " + short(e.startDate)) + ".");
     if (today.length === 2) parts.push("One more after that: " + today[1].title + (today[1].isAllDay ? "" : " at " + short(today[1].startDate)) + ".");
@@ -1194,6 +1410,7 @@ function composeBrief(today, tom, due, headline, wx, extra) {
   }
   if (due.length === 1) parts.push("One reminder outstanding: " + due[0].title + ".");
   else if (due.length > 1) parts.push(due.length + " reminders outstanding, " + due[0].title + " among them.");
+  if (notes && notes.length) parts.push(notes[0]);
   if (extra && extra.leave) parts.push(extra.leave);
   const wl = weatherLine(wx); if (wl) parts.push(wl);
   if (extra && extra.battery) parts.push(extra.battery);
@@ -1206,7 +1423,7 @@ function composeBrief(today, tom, due, headline, wx, extra) {
 }
 
 // Let him write it himself, in his own voice, at most once an hour.
-async function writeBrief(today, tom, due, headline, wx, extra) {
+async function writeBrief(today, tom, due, headline, wx, extra, notes, changed) {
   const short = t => niceTime(t).replace(/ in the (morning|afternoon|evening)/, "");
   const facts = [
     "Time of day greeting to use: " + greetingWord(),
@@ -1217,11 +1434,17 @@ async function writeBrief(today, tom, due, headline, wx, extra) {
     headline ? "Top headline: " + headline : "No headline available",
     extra && extra.leave ? "Timing: " + extra.leave : "",
     extra && extra.battery ? "Battery: " + extra.battery : "",
+    notes && notes.length ? "Things you have noticed:\n" + notes.map(n => "- " + n).join("\n") : "",
+    changed ? "Changed since he last looked: " + changed : "",
     wx ? `Weather: ${wx.word || ""} ${wx.now}C, high ${wx.high}, low ${wx.low}${wx.rain != null ? ", chance of rain " + wx.rain + "%" : ""}${wx.sunset ? ", sunset " + niceTime(new Date(wx.sunset)).replace(/ in the (morning|afternoon|evening)/, "") : ""}` : "No weather available"
   ].join("\n");
   const sys = personaPrompt(addressee()) + `
 
-Write ONE short paragraph to be read on a home screen widget: a greeting, what is on, what is outstanding, the weather if it bears on his day, the headline if there is one, and a single dry remark to finish. Flowing prose, no lists, no headings, no line breaks. Between 30 and 55 words. Only state what the facts below say; invent nothing. Exactly one barb, at the end.`;
+${SHAPE[dayPart()]}
+
+Write ONE short paragraph to be read on a home screen widget: the greeting, then what matters for this part of the day, the weather only if it bears on what he is doing, the headline if there is one, and a single dry remark to finish. Flowing prose, no lists, no headings, no line breaks. Between 30 and 55 words. Only state what the facts below say; invent nothing. Exactly one barb, at the end.
+
+If something is marked as changed since he last looked, lead with that rather than restating what he already knows. If you have been given things you noticed, work at most ONE of them in — the most telling — and leave the rest. An observation is worth more than another list of engagements.`;
   return (await gemini(sys, facts, false)).trim().replace(/\s+/g, " ");
 }
 
@@ -1266,16 +1489,33 @@ async function widget() {
 
   // The paragraph. His own words if he can manage it, hourly.
   let text = null;
-  const sig = today.map(e => e.title).join("|") + "#" + due.length + "#" + (headline || "") + "#" + greetingWord() + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "");
-  const written = cache.briefAt && (Date.now() - new Date(cache.briefAt) < 3600 * 1000) && cache.briefSig === sig;
+  const notes = size === "small" ? [] : await noticings(today, tom, due);
+
+  // What's new since he last drew this: a fresh engagement, or a reminder gone.
+  const state = today.map(e => e.title).sort().join("|") + "#" + (due || []).map(r => r.title).sort().join("|");
+  let changed = "";
+  if (cache.state && cache.state !== state) {
+    const wasEv = (cache.state.split("#")[0] || "").split("|").filter(Boolean);
+    const nowEv = today.map(e => e.title).sort();
+    const added = nowEv.filter(t => !wasEv.includes(t));
+    const wasR = (cache.state.split("#")[1] || "").split("|").filter(Boolean);
+    const nowR = (due || []).map(r => r.title).sort();
+    const goneR = wasR.filter(t => !nowR.includes(t));
+    if (added.length) changed = "new in the diary: " + added.join(", ");
+    else if (goneR.length) changed = "ticked off: " + goneR.join(", ");
+  }
+  cache.state = state;
+
+  const sig = state + "#" + (headline || "") + "#" + dayPart() + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "") + "#" + notes.join("|");
+  const written = cache.briefAt && (Date.now() - new Date(cache.briefAt) < 3600 * 1000) && cache.briefSig === sig && cache.briefPart === dayPart();
   if (written && cache.brief) text = cache.brief;
   else if (size !== "small" && Keychain.contains("valet.gemini")) {
     try {
-      text = await writeBrief(today, tom, due, headline, wx, extra);
-      cache.brief = text; cache.briefAt = new Date().toISOString(); cache.briefSig = sig;
+      text = await writeBrief(today, tom, due, headline, wx, extra, notes, changed);
+      cache.brief = text; cache.briefAt = new Date().toISOString(); cache.briefSig = sig; cache.briefPart = dayPart();
     } catch (e) { text = null; }
   }
-  if (!text) text = composeBrief(today, tom, size === "small" ? [] : due, headline, wx, extra);
+  if (!text) text = composeBrief(today, tom, size === "small" ? [] : due, headline, wx, extra, notes);
   if (size === "small") text = text.split(". ").slice(0, 2).join(". ") + (text.endsWith(".") ? "" : ".");
   writeCache(cache);
 
@@ -1317,7 +1557,7 @@ if (config.runsInWidget) {
     try { td = (await eventsToday()).filter(e => e.endDate > new Date()); } catch (e) {}
     try { tm = await eventsTomorrow(); } catch (e) {}
     try { du = await remindersDue(); } catch (e) {}
-    line = composeBrief(td, tm, du, cached.headline, cached.wx, {});
+    line = composeBrief(td, tm, du, cached.headline, cached.wx, {}, await noticings(td, tm, du));
   }
   say(line);
   const a = new Alert(); a.message = line; a.addAction("Very good"); a.addAction("Go on then");
