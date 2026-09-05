@@ -3,7 +3,7 @@
 // Add to Siri from the script's settings so "Hey Siri, <name>" opens him.
 // Optional: add a Scriptable widget and choose this script for a standing brief.
 
-const VERSION = "4.4";
+const VERSION = "4.4.1";
 
 // ───────────────────────── Phrase book ─────────────────────────
 const P = {
@@ -2197,7 +2197,7 @@ async function widget() {
     // 3. A hairline in brass, a quarter strength: a full-width row one point tall.
     w.addSpacer(8);
     line(1, s => { s.backgroundColor = brass(0.25); s.cornerRadius = 0.5; });
-    w.addSpacer(8);
+    w.addSpacer(10);   // so the paragraph doesn't crowd the rule
   } else {
     w.addSpacer(6);
   }
