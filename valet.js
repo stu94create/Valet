@@ -3,7 +3,7 @@
 // Add to Siri from the script's settings so "Hey Siri, <name>" opens him.
 // Optional: add a Scriptable widget and choose this script for a standing brief.
 
-const VERSION = "4.1";
+const VERSION = "4.2";
 
 // ───────────────────────── Phrase book ─────────────────────────
 const P = {
@@ -13,7 +13,7 @@ const P = {
   morning: "Good morning", afternoon: "Good afternoon", evening: "Good evening", night: "You're up late. I shan't ask",
   nothingToday: "Nothing in the diary today. I shall try to contain my astonishment.",
   quiet: "A quiet evening. I've assumed you'll want the wireless, since you always do.",
-  remindersDue: n => n === 1 ? "One reminder outstanding." : `${n} reminders outstanding, several of them familiar.`,
+  remindersDue: n => n === 1 ? "One reminder outstanding." : n === 2 ? "Two reminders outstanding." : `${n} reminders outstanding, several of them familiar.`,
   fetch: a => `Shall I fetch ${a}?`,
   fetching: a => `Fetching ${a}.`,
   fetchingAgain: a => `Fetching ${a}. Again.`,
@@ -38,7 +38,7 @@ const P = {
   papersEmpty: "The papers haven't arrived. I'd blame the newsagent, but it's usually the wireless connection.",
   papersFrom: s => `From ${s}:`,
   papersDone: "That's the lot. None of it was your fault, for once.",
-  theHalf: e => `The half, sir. ${e} in thirty minutes. You'll want shoes.`,
+  theHalf: (e, a) => `The half, ${a}. ${e} in thirty minutes. You'll want shoes.`,
   briefNotice: "Your brief is ready. It has been for some time.",
   newsNotice: "The papers have arrived. Nothing has improved.",
   arranged: "Arranged. I'll remind you, since I'm the one who remembers.",
@@ -61,7 +61,10 @@ const P = {
   changesIntro: "This edition, in brief.",
   quietArranged: "Quiet hours arranged. I shall hold my tongue.",
   putOff: w => `Put off until ${w}. It will keep; they always do.`,
-  leftIt: "Left where it was."
+  leftIt: "Left where it was.",
+  notSent: "Not sent. I'll assume you thought better of it.",
+  diaryShut: "The diary and the reminders are shut to me; the telephone hasn't given me leave. The particulars are below stairs.",
+  fellOver: "Something has gone wrong below stairs. I've made a note of it; the particulars are there."
 };
 
 const DUTIES = [
@@ -211,13 +214,13 @@ async function warmCache() {
 }
 function clearVoiceCache() { for (const f of fm.listContents(voiceDir)) fm.remove(fm.joinPath(voiceDir, f)); }
 let lastVoiceError = "";
+// Lines queue: each waits for the one before, so nothing talks over him.
 function say(t) {
   if (!S.speak) return;
-  if (hasEleven()) {
-    lastSpeech = elevenSpeak(t).catch(e => { lastVoiceError = String(e && e.message || e); fault("His voice", lastVoiceError); Speech.speak(t); });
-  } else {
-    Speech.speak(t);
-  }
+  lastSpeech = lastSpeech.catch(() => {}).then(() => {
+    if (!hasEleven()) { Speech.speak(t); return; }
+    return elevenSpeak(t).catch(e => { lastVoiceError = String(e && e.message || e); fault("His voice", lastVoiceError); Speech.speak(t); });
+  });
 }
 async function tell(t) { say(t); const a = new Alert(); a.message = t; a.addAction("Very good"); await a.present(); }
 
@@ -253,14 +256,30 @@ function eventWords(e, dayWord) {
   if (e.startDate <= now && e.endDate > now) return "now, until " + niceTime(e.endDate); // in progress, not upcoming
   return "at " + niceTime(e.startDate);
 }
-function tomorrowWords(e) { return e.isAllDay ? (spanWords(e) ? "from tomorrow, " + spanWords(e) : "tomorrow") : "tomorrow at " + niceTime(e.startDate); }
+function tomorrowWords(e) {
+  if (!e.isAllDay) return "tomorrow at " + niceTime(e.startDate);
+  const sp = spanWords(e);
+  if (e.startDate <= new Date()) return sp ? "still on tomorrow, " + sp : "still on tomorrow"; // under way already; not "from tomorrow"
+  return sp ? "from tomorrow, " + sp : "tomorrow";
+}
+// A running all-day entry (a trip, a week away) that merely continues tomorrow.
+function continuing(e) { return e.isAllDay && e.startDate <= new Date(); }
+// Timed engagements first, in order; all-day entries after. The thing with a
+// clock on it is what leads a briefing.
+function leadOrder(list) {
+  const timed = (list || []).filter(e => !e.isAllDay).sort((a, b) => a.startDate - b.startDate);
+  return timed.concat((list || []).filter(e => e.isAllDay));
+}
 
 // ───────────────────────── Reminders, spoken ─────────────────────────
 // Titles are tidied and no more: a capital to start, and a space where a
 // letter runs straight into a digit. What he says of a reminder: when it is
 // due, in clock words; overdue, said plainly; which list, when more than one
 // is in play; the priority, only if high. Notes are kept for the tap.
-function tidy(s) { return cap(String(s || "").trim().replace(/([A-Za-z])(\d)/g, "$1 $2")); }
+function tidy(s) {
+  const t = String(s || "").trim().replace(/\b([a-z]+)(\d)/g, "$1 $2");   // "for30", not "MP3", "A4", "Covid19" or "3D"
+  return /^[a-z][A-Z]/.test(t) ? t : cap(t);                                // leave iPhone and eBay their own capitals
+}
 function clockWords(d) {
   const h = d.getHours(), m = d.getMinutes(), hr = x => String(x % 12 || 12);
   const period = h < 12 ? " in the morning" : h < 18 ? " in the afternoon" : " in the evening";
@@ -332,13 +351,19 @@ function parseWhen(text) {
     d.setMonth(months.indexOf(dm[5]), +dm[2]); if (d < new Date()) d.setFullYear(d.getFullYear() + 1);
     t = t.replace(dm[0], " "); found = true;
   }
-  const tm = t.match(/\b(at |for )?(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|o'clock|in the morning|in the afternoon|in the evening)?\b/);
-  if (tm && (tm[1] || tm[3] || tm[4])) {
+  // The first thing that is really a clock time: not "30 minutes", not 25 o'clock.
+  const timeRe = /\b(at |for )?(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|o'clock|in the morning|in the afternoon|in the evening)?\b/g;
+  let tm;
+  while ((tm = timeRe.exec(t))) {
+    if (!(tm[1] || tm[3] || tm[4])) continue;
+    if (/^\s*(minutes?|mins?|hours?|hrs?)\b/.test(t.slice(tm.index + tm[0].length))) continue; // a duration, not a time
     let h = +tm[2], m = tm[3] ? +tm[3] : 0, s = tm[4] || "";
+    if (h > 23 || m > 59) continue;
     if ((s === "pm" || s === "in the afternoon" || s === "in the evening") && h < 12) h += 12;
     if (s === "am" && h === 12) h = 0;
     if (!s && h < 8) h += 12; // "at 2" means the afternoon unless you say otherwise
     d.setHours(h, m); hasTime = true; found = true; t = t.replace(tm[0], " ");
+    break;
   }
   if (/\b(tonight|this evening)\b/.test(t)) { if (!hasTime) d.setHours(19, 0); hasTime = true; found = true; t = t.replace(/\b(tonight|this evening)\b/, " "); }
   if (!found) { d.setHours(9, 0); }
@@ -350,7 +375,12 @@ function parseWhen(text) {
 async function eventsToday() { return await CalendarEvent.today(); }
 async function eventsTomorrow() { return await CalendarEvent.tomorrow(); }
 async function eventsWeek() { const a = new Date(), b = new Date(); b.setDate(a.getDate() + 7); return await CalendarEvent.between(a, b); }
-async function remindersDue() { const all = await Reminder.allDueToday(); return all.filter(r => !r.isCompleted); }
+// Everything due by the end of today, the overdue included: what requires you.
+async function remindersDue() {
+  const end = new Date(); end.setHours(23, 59, 59, 999);
+  const all = await Reminder.allIncomplete();
+  return all.filter(r => !r.isCompleted && r.dueDate && r.dueDate <= end).sort((a, b) => a.dueDate - b.dueDate);
+}
 async function addEvent(title, when, hasTime) {
   const e = new CalendarEvent();
   e.title = cap(title); e.calendar = await Calendar.defaultForEvents();
@@ -358,9 +388,10 @@ async function addEvent(title, when, hasTime) {
   e.isAllDay = !hasTime; e.save();
   return e;
 }
+// No date given, no date set: he doesn't invent nine in the morning.
 async function addReminder(title, when, hasTime) {
   const r = new Reminder(); r.title = cap(title); r.calendar = await Calendar.defaultForReminders();
-  if (hasTime) r.dueDate = when; else r.dueDate = when;
+  if (when) { r.dueDate = when; r.dueDateIncludesTime = !!hasTime; }
   r.save(); return r;
 }
 
@@ -425,9 +456,18 @@ function suggestion() {
   const rested = S.apps.filter(a => !justHad(a.n));
   return { app: rested.find(a => a.n === want) || rested[0] || S.apps[0], confident: false };
 }
+// Whole words only, three letters at least, never on nothing: "no" is not
+// "Things not to be forgotten", and "open" on its own fetches nobody.
+function wordMatch(hay, needle) {
+  const n = String(needle || "").trim().toLowerCase();
+  if (n.length < 3) return false;
+  const re = new RegExp("(^|[^a-z0-9])" + n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "($|[^a-z0-9])");
+  return re.test(String(hay || "").toLowerCase());
+}
 function findApp(name) {
-  const n = name.toLowerCase();
-  return S.apps.find(a => a.n.toLowerCase() === n) || S.apps.find(a => a.n.toLowerCase().startsWith(n)) || S.apps.find(a => a.n.toLowerCase().includes(n)) || null;
+  const n = String(name || "").trim().toLowerCase();
+  if (n.length < 3) return null;
+  return S.apps.find(a => a.n.toLowerCase() === n) || S.apps.find(a => wordMatch(a.n, n)) || null;
 }
 
 
@@ -613,7 +653,11 @@ async function carryOut(j, original) {
     case "text": record(`Text to ${j.who}: ${j.body}`); if (spoken) say(spoken); await sendText(j.who || "", j.body || ""); return null;
     case "email": record(`Email to ${j.who}`); if (spoken) say(spoken); await sendEmail(j.who || "", j.body || ""); return null;
     case "call": if (spoken) say(spoken); await ringUp(j.who || ""); return null;
-    case "remind": { const w = parseWhen(j.when || ""); await addReminder(j.body || original, w.date, w.hasTime); record(`Reminder: ${j.body}`); return spoken || `${P.noted} ${cap(j.body || original)}, ${niceDay(w.date)}.`; }
+    case "remind": {
+      const w = j.when ? parseWhen(j.when) : null, dated = w && w.found;   // nothing said about when: left undated
+      await addReminder(j.body || original, dated ? w.date : null, dated ? w.hasTime : false); record(`Reminder: ${j.body}`);
+      return spoken || `${P.noted} ${cap(j.body || original)}${dated ? ", " + niceDay(w.date) : ""}.`;
+    }
     case "event": { const w = parseWhen(j.when || ""); await addEvent(j.body || original, w.date, w.hasTime); record(`Diary: ${j.body} on ${niceDay(w.date)}`); return spoken || `${P.noted} ${cap(j.body || original)}, ${niceDay(w.date)}${w.hasTime ? " at " + niceTime(w.date) : ""}.`; }
     case "events": case "reminders": return spoken || "";
     case "news": if (spoken) say(spoken); await papers(true); return null;
@@ -652,17 +696,23 @@ async function conversation(opening) {
 async function brief() {
   const h = new Date().getHours();
   const parts = [`${h < 5 ? P.night : h < 12 ? P.morning : h < 18 ? P.afternoon : P.evening}, ${addressee()}.`];
-  const today = (await eventsToday()).filter(e => e.endDate > new Date());
-  if (today.length) {
-    const e = today[0];
-    parts.push(`${tidy(e.title)} ${eventWords(e, "today")}.` + (today.length > 1 ? ` ${today.length - 1} more after that.` : ""));
-  } else {
-    const tom = await eventsTomorrow();
-    if (tom.length) parts.push(`${tidy(tom[0].title)} ${tomorrowWords(tom[0])}.`);
-    else parts.push(h < 18 ? P.nothingToday : P.quiet);
-  }
-  const due = await remindersDue();
-  if (due.length) parts.push(P.remindersDue(due.length) + (due.length === 1 ? ` ${reminderWords(due[0], listsOf(due))}.` : ""));
+  let today = [], due = [], shut = false;
+  try {
+    today = leadOrder((await eventsToday()).filter(e => e.endDate > new Date()));
+    if (today.length) {
+      const e = today[0];
+      parts.push(`${tidy(e.title)} ${eventWords(e, "today")}.` + (today.length > 1 ? ` ${today.length - 1} more after that.` : ""));
+    } else {
+      const tom = (await eventsTomorrow()).filter(e => !continuing(e));   // a trip that merely goes on isn't news
+      if (tom.length) parts.push(`${tidy(tom[0].title)} ${tomorrowWords(tom[0])}.`);
+      else parts.push(h < 18 ? P.nothingToday : P.quiet);
+    }
+  } catch (e) { shut = true; fault("The diary", e && e.message || e); }
+  try {
+    due = await remindersDue();
+    if (due.length) parts.push(P.remindersDue(due.length) + (due.length === 1 ? ` ${reminderWords(due[0], listsOf(due))}.` : ""));
+  } catch (e) { shut = true; fault("The reminders", e && e.message || e); }
+  if (shut) parts.push(P.diaryShut);
   if (h >= 6 && h < 12 && S.feeds.length) parts.push(P.papersOnTray);
   return { text: parts.join(" "), today, due };
 }
@@ -677,7 +727,7 @@ function decode(s) {
 async function fetchPaper(feed) {
   const r = new Request(feed.u); r.timeoutInterval = 8;
   let xml = "";
-  const failed = error => { fault("The newsagent", `${feed.n}: ${error}`); return { paper: feed, items: [], error }; };
+  const failed = error => ({ paper: feed, items: [], error });
   try { xml = await r.loadString(); } catch (e) { return failed("no reply: " + (e.message || e)); }
   const code = r.response && r.response.statusCode;
   if (code && code !== 200) return failed(`said ${code}`);
@@ -692,7 +742,22 @@ async function fetchPaper(feed) {
   if (!items.length) return failed(blocks.length ? "arrived, but couldn't be read" : "arrived, but isn't a feed I recognise");
   return { paper: feed, items };
 }
-async function fetchPapers() { return await Promise.all(S.feeds.map(fetchPaper)); }
+// A paper that fails once is weather; one that fails three times running is
+// worth a note below stairs. The tally lives in the widget cache; pass the
+// cache in if you already hold it, so nobody's copy overwrites another's.
+async function fetchPapers(cache) {
+  const ps = await Promise.all(S.feeds.map(fetchPaper));
+  const own = !cache; if (own) cache = readCache();
+  const failing = cache.failing || {};
+  for (const p of ps) {
+    if (!p.error) { delete failing[p.paper.u]; continue; }
+    failing[p.paper.u] = (failing[p.paper.u] || 0) + 1;
+    if (failing[p.paper.u] === 3) fault("The newsagent", `${p.paper.n}: ${p.error}, three times running`);
+  }
+  cache.failing = failing;
+  if (own) writeCache(cache);
+  return ps;
+}
 
 // A short spoken form: "From RTÉ: a, b, c."
 function papersSpeech(papers) {
@@ -810,7 +875,7 @@ async function scheduleNotices() {
     if (S.notices.news) for (const off of [0, 1]) mk(`valet.news.${off}`, P.newsNotice, at(S.notices.news, off));
     if (S.notices.half) {
       const evs = [...(await eventsToday()), ...(await eventsTomorrow())].filter(e => !e.isAllDay);
-      evs.slice(0, 12).forEach((e, i) => mk(`valet.half.${i}`, P.theHalf(tidy(e.title)), new Date(e.startDate.getTime() - 30 * 60 * 1000)));
+      evs.slice(0, 12).forEach((e, i) => mk(`valet.half.${i}`, P.theHalf(tidy(e.title), addressee()), new Date(e.startDate.getTime() - 30 * 60 * 1000)));
     }
   } catch (e) {}
 }
@@ -831,10 +896,18 @@ async function handle(text) {
   let m;
 
   // Messages: "message Margaret running late", "text Tom ...", "whatsapp Ann ..."
-  if ((m = low.match(/^(message|whatsapp|tell)\s+([a-z' -]+?)\s+(?:that\s+|to\s+say\s+)?(.+)$/))) return await sendWhatsApp(m[2], m[3]);
+  if ((m = low.match(/^(message|whatsapp)\s+([a-z' -]+?)\s+(?:that\s+|to\s+say\s+)?(.+)$/))) return await sendWhatsApp(m[2], m[3]);
   if ((m = low.match(/^(text|sms)\s+([a-z' -]+?)\s+(?:that\s+)?(.+)$/))) return await sendText(m[2], m[3]);
   if ((m = low.match(/^(email|e-mail|mail|write to)\s+([a-z' -]+?)(?:\s+(?:about|re|saying)\s+(.+))?$/))) return await sendEmail(m[2], m[3] || "");
   if ((m = low.match(/^(ring|call|phone|telephone)\s+([a-z' -]+)$/))) return await ringUp(m[2]);
+
+  // Remembering and recalling. "Note" means remember; it comes before the diary.
+  if ((m = low.match(/^(remember|note|keep in mind|don't forget)(?: that)?\s+(.+)$/))) { remember(m[2], "told"); return await tell(P.remembered); }
+  if ((m = low.match(/^(what did i (?:say|tell you) about|what do you know about|what was i meant to do about)\s+(.+?)\??$/))) {
+    const hits = searchNotes(m[2]);
+    if (!hits.length) return await tell(P.cantRecall);
+    return await tell(hits.map(h => `${h.at.slice(0, 10)}: ${h.t}`).join(". "));
+  }
 
   // Reminders
   if ((m = low.match(/^remind me (?:to |that |about )?(.+)$/))) {
@@ -853,26 +926,20 @@ async function handle(text) {
     if (/week/.test(low)) return await readEvents(await eventsWeek(), "this week");
     return await readEvents((await eventsToday()).filter(e => e.endDate > new Date()), "today");
   }
-  if ((m = low.match(/^(?:add|put|note|book|diary)\s+(.+)$/))) {
+  if ((m = low.match(/^(?:add|put|book|diary)\s+(.+)$/))) {
     const w = parseWhen(m[1]); if (!w.found) return await tell("When would that be?");
     await addEvent(w.rest, w.date, w.hasTime);
     return await tell(`${P.noted} ${cap(w.rest)}, ${niceDay(w.date)}${w.hasTime ? " at " + niceTime(w.date) : ""}.`);
   }
 
-  // Apps and duties
-  const name = low.replace(/^(bring me|bring|fetch|open|get me|get|the)\s+/, "").replace(/^the\s+/, "").trim();
-  const app = findApp(name); if (app) return await fetchApp(app);
-  const duty = DUTIES.find(d => d.name.toLowerCase().includes(name) || d.id.includes(name)); if (duty) return await openDuty(duty);
-
   // This edition
   if (/^(what('s| is| has) (new|changed)|what changed)\b/.test(low)) return await tell(P.changesIntro + " " + CHANGES.join(" "));
 
-  // Remembering and recalling
-  if ((m = low.match(/^(remember|note|keep in mind|don't forget)(?: that)?\s+(.+)$/))) { remember(m[2], "told"); return await tell(P.remembered); }
-  if ((m = low.match(/^(what did i (?:say|tell you) about|what do you know about|what was i meant to do about)\s+(.+?)\??$/))) {
-    const hits = searchNotes(m[2]);
-    if (!hits.length) return await tell(P.cantRecall);
-    return await tell(hits.map(h => `${h.at.slice(0, 10)}: ${h.t}`).join(". "));
+  // Apps and duties: whole words, three letters or more, never on nothing.
+  const name = low.replace(/^(bring me|bring|fetch|open|get me|get|the)\s+/, "").replace(/^the\s+/, "").trim();
+  if (name.length >= 3) {
+    const app = findApp(name); if (app) return await fetchApp(app);
+    const duty = DUTIES.find(d => wordMatch(d.name, name) || wordMatch(d.id, name)); if (duty) return await openDuty(duty);
   }
 
   // Anything else becomes conversation, if there's a key.
@@ -904,13 +971,15 @@ async function sendText(who, body) {
   const c = await findContact(who); if (!c) return await tell(P.noSuch(cap(who)));
   const num = firstPhone(c); if (!num) return await tell(P.noNumber(c.givenName));
   const msg = new Message(); msg.recipients = [num]; msg.body = cap(body);
-  say("Ready to send. It only wants your thumb."); await msg.send(); say(P.dispatched);
+  say("Ready to send. It only wants your thumb.");
+  try { await msg.send(); say(P.dispatched); } catch (e) { say(P.notSent); }   // the sheet was put away
 }
 async function sendEmail(who, about) {
   const c = await findContact(who); if (!c) return await tell(P.noSuch(cap(who)));
   const em = firstEmail(c); if (!em) return await tell(P.noEmail(c.givenName));
   const mail = new Mail(); mail.toRecipients = [em]; mail.subject = cap(about); mail.body = "";
-  say("Ready to send. It only wants your thumb."); await mail.send(); say(P.dispatched);
+  say("Ready to send. It only wants your thumb.");
+  try { await mail.send(); say(P.dispatched); } catch (e) { say(P.notSent); }
 }
 async function ringUp(who) {
   const c = await findContact(who); if (!c) return await tell(P.noSuch(cap(who)));
@@ -1329,7 +1398,9 @@ async function introduce(again) {
   const a = new Alert(); a.title = again ? "Of course." : "An introduction";
   a.message = again ? "What would you have me called?" : P.introFirst; say(a.message);
   a.addTextField("His name", S.valet || ""); a.addAction("Very good");
-  await a.present(); const n = a.textFieldValue(0).trim(); if (!n) return introduce(again);
+  if (again) a.addCancelAction("Never mind");                       // keeps the name he has
+  const ai = await a.present(); if (ai === -1) return;
+  const n = a.textFieldValue(0).trim(); if (!n) return again ? undefined : introduce(again);
   S.valet = n;
   const b = new Alert(); b.title = n; b.message = P.introSecond(n); say(b.message);
   b.addAction("Sir"); b.addAction("Madam"); b.addAction("By my first name"); b.addAction("Something else");
@@ -1387,25 +1458,34 @@ async function wentWrong() {
 }
 
 const CHANGES = [
-  "The widget keeps up. Every draw starts from the diary as it stands: nothing that has finished, and anything under way said as now. I ask the telephone to redraw at the moments that matter, and my written paragraph is dropped the instant it stops being true. It says when I last looked, so you know.",
-  "Reminders are fuller: when they're due, in clock words; overdue said plainly; the list, when more than one is in play; the priority, when it's high. Tap one and I read it out, notes and all, and offer to tick it off or put it off until later today or tomorrow.",
-  "Titles are tidied before I say them: a capital to start, and a space where a letter ran into a digit."
+  "Overdue reminders now reach the front door and the briefing, not only the full list. You may find one or two you'd forgotten. That is rather the point.",
+  "I listen more carefully. A short word is no longer taken for an app or a screen, 'note' means remember, and 'tell me' is a question rather than a message to somebody called Me.",
+  "Times are checked: thirty minutes is a duration, not half past twenty-nine. A reminder with no date stays undated rather than being fixed for nine in the morning.",
+  "I speak one line at a time, and I no longer talk over myself.",
+  "A trip already under way is not announced as starting tomorrow, does not lead the briefing ahead of the day's engagements, and is not repeated in the evening.",
+  "If the telephone won't let me at the diary, or you put a message away unsent, I say so rather than falling over."
 ];
-const PAST_CHANGES = [
-  "Nothing about you lives in the script any more. Tell me about the household below stairs and I'll write accordingly; say nothing and I'll assume nothing.",
-  "The front door is in order: my briefing, then what requires you, then one suggestion, then three ways of asking me, then the household.",
-  "I weigh recent habits over old ones, keep weekdays apart from weekends, and won't suggest what you've only just had.",
-  "When something fails I say so plainly and keep the particulars under what went wrong, below stairs.",
-  "Below stairs is grouped: himself, the household, his mind, arrangements, housekeeping. Everything is where it was, only tidier.",
-  "Engagements that run for days are said plainly: all week, or until Friday, rather than at midnight.",
-  "Quiet hours, should you want them: no notices, and a one-line brief on the widget."
+const PAST = [
+  { edition: "4.1", items: [
+    "The widget keeps up. Every draw starts from the diary as it stands: nothing that has finished, and anything under way said as now. I ask the telephone to redraw at the moments that matter, and my written paragraph is dropped the instant it stops being true. It says when I last looked, so you know.",
+    "Reminders are fuller: when they're due, in clock words; overdue said plainly; the list, when more than one is in play; the priority, when it's high. Tap one and I read it out, notes and all, and offer to tick it off or put it off until later today or tomorrow.",
+    "Titles are tidied before I say them: a capital to start, and a space where a word ran into a digit."
+  ] },
+  { edition: "4.0", items: [
+    "Nothing about you lives in the script any more. Tell me about the household below stairs and I'll write accordingly; say nothing and I'll assume nothing.",
+    "The front door is in order: my briefing, then what requires you, then one suggestion, then three ways of asking me, then the household.",
+    "I weigh recent habits over old ones, keep weekdays apart from weekends, and won't suggest what you've only just had.",
+    "When something fails I say so plainly and keep the particulars under what went wrong, below stairs.",
+    "Below stairs is grouped: himself, the household, his mind, arrangements, housekeeping. Everything is where it was, only tidier.",
+    "Engagements that run for days are said plainly: all week, or until Friday, rather than at midnight.",
+    "Quiet hours, should you want them: no notices, and a one-line brief on the widget."
+  ] }
 ];
 async function whatsChanged() {
   const table = new UITable(); table.showSeparators = true;
   table.addRow(infoRow(`${P.changesIntro} Edition ${VERSION}.`));
   CHANGES.forEach(c => table.addRow(infoRow(c)));
-  table.addRow(headerRow("Edition 4.0"));
-  PAST_CHANGES.forEach(c => table.addRow(infoRow(c)));
+  for (const past of PAST) { table.addRow(headerRow(`Edition ${past.edition}`)); past.items.forEach(c => table.addRow(infoRow(c))); }
   await table.present(false);
 }
 
@@ -1448,8 +1528,9 @@ const WMO = {
   85: "snow showers", 86: "snow showers",
   95: "thundery", 96: "thundery", 99: "thundery"
 };
-async function outlook() {
-  const cache = readCache();
+// Pass the cache in if you already hold it, so your later write doesn't undo this one.
+async function outlook(cache) {
+  const own = !cache; if (own) cache = readCache();
   const fresh = cache.wxAt && (Date.now() - new Date(cache.wxAt) < 90 * 60 * 1000);
   if (fresh && cache.wx) return cache.wx;
   try {
@@ -1475,11 +1556,14 @@ async function outlook() {
       sunset: j.daily && j.daily.sunset ? new Date(j.daily.sunset[0]).toISOString() : null
     };
     lastWeatherError = "";
-    cache.wx = wx; cache.wxAt = new Date().toISOString(); writeCache(cache);
+    cache.wx = wx; cache.wxAt = new Date().toISOString(); delete cache.wxFails;
+    if (own) writeCache(cache);
     return wx;
   } catch (e) {
     lastWeatherError = String((e && e.message) || e);
-    fault("The weather", lastWeatherError);
+    cache.wxFails = (cache.wxFails || 0) + 1;                        // three in a row is worth a note; one is weather
+    if (cache.wxFails === 3) fault("The weather", lastWeatherError + ", three times running");
+    if (own) writeCache(cache);
     return (cache && cache.wx) || null;
   }
 }
@@ -1685,7 +1769,7 @@ const SHAPE = {
 // A remark for a quiet moment. Picked by the day so it doesn't change every refresh.
 const REMARKS = {
   empty: ["Nothing whatever to report.", "The day is entirely yours, which I'm sure will be put to good use.", "An empty diary. Enjoy it while the novelty lasts.",
-          "Not a thing on. I've checked twice.", "A blank page, sir. Do try not to fill it with the telephone."],
+          "Not a thing on. I've checked twice.", "A blank page, {a}. Do try not to fill it with the telephone."],
   busy: ["I'd allow extra time.", "You'll want to be dressed for at least one of those.", "A full day. My condolences.",
          "Ambitious, but not impossible.", "I shall have the tea ready."],
   evening: ["The wireless, I imagine.", "Nothing further tonight, unless you insist.", "The day is closed. I've closed it.",
@@ -1695,22 +1779,24 @@ const REMARKS = {
 function remark(kind) {
   const list = REMARKS[kind] || REMARKS.empty;
   const d = new Date();
-  return list[(d.getDate() + d.getHours()) % list.length];
+  return list[(d.getDate() + d.getHours()) % list.length].replace("{a}", addressee());
 }
 
 // Assemble the paragraph without help.
 function composeBrief(today, tom, due, headline, wx, extra, notes) {
   const parts = [greetingWord() + ", " + addressee() + "."];
   const short = s => s.replace(/ in the (morning|afternoon|evening)/, "");
-  if (dayPart() === "evening" && tom.length) {
-    parts.push("That's the day. " + tidy(tom[0].title) + " " + short(tomorrowWords(tom[0])) + ".");
+  today = leadOrder(today);                                  // the timed thing leads
+  const fresh = (tom || []).filter(e => !continuing(e));      // not the trip that merely goes on
+  if (dayPart() === "evening" && fresh.length && !today.some(e => !e.isAllDay)) {   // nothing timed left tonight
+    parts.push("That's the day. " + tidy(fresh[0].title) + " " + short(tomorrowWords(fresh[0])) + ".");
   } else if (today.length) {
     const e = today[0];
     parts.push(tidy(e.title) + " " + short(eventWords(e, "today")) + ".");
     if (today.length === 2) parts.push("One more after that: " + tidy(today[1].title) + " " + short(eventWords(today[1], "all day")) + ".");
     else if (today.length > 2) parts.push((today.length - 1) + " more after that, ending with " + tidy(today[today.length - 1].title) + ".");
-  } else if (tom.length) {
-    parts.push("Nothing today. " + tidy(tom[0].title) + " " + short(tomorrowWords(tom[0])) + ".");
+  } else if (fresh.length) {
+    parts.push("Nothing today. " + tidy(fresh[0].title) + " " + short(tomorrowWords(fresh[0])) + ".");
   } else {
     parts.push(remark(new Date().getHours() >= 18 ? "evening" : "empty"));
   }
@@ -1731,11 +1817,12 @@ function composeBrief(today, tom, due, headline, wx, extra, notes) {
 // Let him write it himself, in his own voice, at most once an hour.
 async function writeBrief(today, tom, due, headline, wx, extra, notes, changed) {
   const words = (e, d) => eventWords(e, d).replace(/ in the (morning|afternoon|evening)/, "");
+  today = leadOrder(today);
   const facts = [
     "Time of day greeting to use: " + greetingWord(),
     "Address him as: " + addressee(),
     "Today: " + (today.length ? today.map(e => tidy(e.title) + " " + words(e, "all day")).join("; ") : "nothing"),
-    "Tomorrow: " + (tom.length ? tom.map(e => tidy(e.title) + " " + words(e, "all day")).join("; ") : "nothing"),
+    "Tomorrow: " + (tom.length ? tom.map(e => tidy(e.title) + " " + (continuing(e) ? "continuing, " + (spanWords(e) || "all day") : words(e, "all day"))).join("; ") : "nothing"),
     "Reminders outstanding: " + (due.length ? due.map(r => reminderWords(r, listsOf(due))).join("; ") : "none"),
     headline ? "Top headline: " + headline : "No headline available",
     extra && extra.leave ? "Timing: " + extra.leave : "",
@@ -1760,12 +1847,13 @@ If something is marked as changed since he last looked, lead with that rather th
 // start and whether it is upcoming or under way, every reminder due with
 // its time, and the part of day. If any of it changes, the written
 // paragraph is stale and is not shown.
-function factsKey(today, due) {
+function factsKey(today, due, tom) {
   const now = new Date();
   const phase = e => e.isAllDay ? "day" : e.startDate > now ? "soon" : "now";
   const ev = (today || []).map(e => `${e.title}@${e.startDate.getTime()}:${phase(e)}`).sort().join("|");
+  const tm = (tom || []).map(e => `${e.title}@${e.startDate.getTime()}`).sort().join("|");
   const rm = (due || []).map(r => `${r.title}@${r.dueDate ? r.dueDate.getTime() : 0}`).sort().join("|");
-  return ev + "#" + rm + "#" + dayPart();
+  return ev + "#" + tm + "#" + rm + "#" + dayPart();
 }
 // Only the facts as they stand: nothing that has ended, nothing from cache.
 async function liveFacts() {
@@ -1808,7 +1896,7 @@ async function widget() {
   const { today, tom, due } = await liveFacts();   // fresh every draw; nothing finished, nothing cached
 
   const cache = readCache();
-  const wx = size === "small" ? null : await outlook();
+  const wx = size === "small" ? null : await outlook(cache);   // into this cache, which is written below
   const extra = {};
   if (size !== "small") {
     extra.leave = await leaveBy(today);
@@ -1821,7 +1909,7 @@ async function widget() {
     const fresh = cache.headlineAt && (Date.now() - new Date(cache.headlineAt) < 3 * 3600 * 1000);
     if (!fresh) {
       try {
-        const ps = await fetchPapers();
+        const ps = await fetchPapers(cache);
         const first = ps.filter(p => p.items.length)[0];
         if (first) { cache.headline = first.items[0].title; cache.headlineAt = new Date().toISOString(); }
       } catch (e) {}
@@ -1849,16 +1937,17 @@ async function widget() {
   }
   cache.state = state;
 
-  const facts = factsKey(today, due);
+  const facts = factsKey(today, due, tom);
   const sig = facts + "#" + (headline || "") + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "") + "#" + notes.join("|");
   const written = cache.briefAt && (Date.now() - new Date(cache.briefAt) < 30 * 60 * 1000) && cache.briefSig === sig;
   if (written && cache.brief) text = cache.brief;
   else if (size !== "small" && Keychain.contains("valet.gemini")) {
     try {
       text = await writeBrief(today, tom, due, headline, wx, extra, notes, changed);
-      cache.brief = text; cache.briefAt = new Date().toISOString(); cache.briefSig = sig; cache.briefFacts = facts; cache.briefPart = dayPart();
+      cache.brief = text; cache.briefAt = new Date().toISOString(); cache.briefSig = sig; cache.briefFacts = facts;
     } catch (e) { text = null; }
   }
+  delete cache.briefPart;
   if (!text) text = composeBrief(today, tom, size === "small" ? [] : due, headline, wx, extra, notes); // local, and never stale
   if (size === "small") text = text.split(". ").slice(0, 2).join(". ") + (text.endsWith(".") ? "" : ".");
   if (inQuietHours()) {                                                   // quiet hours: the greeting and one sentence
@@ -1893,34 +1982,45 @@ async function widget() {
 }
 
 // ───────────────────────── Entry ─────────────────────────
-if (config.runsInWidget) {
-  await widget();
-  if (S.introduced) await scheduleNotices();
-} else if (!S.introduced) {
-  await introduce(false);
-  await home();
-} else if (args.queryParameters && args.queryParameters.read) {
-  // Tapped "Read aloud" on the widget: say the brief and withdraw. His
-  // written paragraph only if it is recent and still true; otherwise a
-  // fresh line from the facts as they stand.
-  const cached = readCache();
-  const { today: td, tom: tm, due: du } = await liveFacts();
-  const recent = cached.brief && cached.briefAt && (Date.now() - new Date(cached.briefAt) < 10 * 60 * 1000) && cached.briefFacts === factsKey(td, du);
-  const line = recent ? cached.brief : composeBrief(td, tm, du, cached.headline, cached.wx, {}, await noticings(td, tm, du));
-  say(line);
-  const a = new Alert(); a.message = line; a.addAction("Very good"); a.addAction("Go on then");
-  if ((await a.present()) === 1) { await scheduleNotices(); await home(); }
-} else if (args.shortcutParameter || (args.plainTexts && args.plainTexts.length)) {
-  // Run from a Shortcut or Siri with words attached: act, say, withdraw.
-  await handle(String(args.shortcutParameter || args.plainTexts[0]));
-} else if (args.notification && args.notification.identifier && args.notification.identifier.startsWith("valet.news")) {
-  // He was tapped from "The papers have arrived".
-  await scheduleNotices();
-  await papers(false);
-} else {
-  await scheduleNotices();
-  warmCache(); // in the background, while you talk to him
-  await home();
+// Whatever goes wrong here lands in his voice and below stairs, never as
+// the telephone's own error dialogue.
+try {
+  if (config.runsInWidget) {
+    await widget();
+    if (S.introduced) await scheduleNotices();
+  } else if (!S.introduced) {
+    await introduce(false);
+    await home();
+  } else if (args.queryParameters && args.queryParameters.read) {
+    // Tapped "Read aloud" on the widget: say the brief and withdraw. His
+    // written paragraph only if it is recent and still true; otherwise a
+    // fresh line from the facts as they stand.
+    const cached = readCache();
+    const { today: td, tom: tm, due: du } = await liveFacts();
+    const recent = cached.brief && cached.briefAt && (Date.now() - new Date(cached.briefAt) < 10 * 60 * 1000) && cached.briefFacts === factsKey(td, du, tm);
+    const line = recent ? cached.brief : composeBrief(td, tm, du, cached.headline, cached.wx, {}, await noticings(td, tm, du));
+    say(line);
+    const a = new Alert(); a.message = line; a.addAction("Very good"); a.addAction("Go on then");
+    if ((await a.present()) === 1) { await scheduleNotices(); await home(); }
+  } else if (args.shortcutParameter || (args.plainTexts && args.plainTexts.length)) {
+    // Run from a Shortcut or Siri with words attached: act, say, withdraw.
+    await handle(String(args.shortcutParameter || args.plainTexts[0]));
+  } else if (args.notification && args.notification.identifier && args.notification.identifier.startsWith("valet.news")) {
+    // He was tapped from "The papers have arrived".
+    await scheduleNotices();
+    await papers(false);
+  } else {
+    await scheduleNotices();
+    warmCache(); // in the background, while you talk to him
+    await home();
+  }
+} catch (e) {
+  fault("The household", (e && e.stack) || (e && e.message) || e);
+  if (config.runsInWidget) {
+    try { const w = new ListWidget(); const t = w.addText(P.fellOver); t.font = Font.systemFont(14); Script.setWidget(w); } catch (e2) {}
+  } else {
+    try { await tell(P.fellOver); } catch (e2) {}
+  }
 }
-await lastSpeech;
+try { await lastSpeech; } catch (e) {}
 Script.complete();
