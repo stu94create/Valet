@@ -62,6 +62,7 @@ const P = {
   quietArranged: "Quiet hours arranged. I shall hold my tongue.",
   putOff: w => `Put off until ${w}. It will keep; they always do.`,
   leftIt: "Left where it was.",
+  nothingOnThisDay: "Nothing of note happened on this day, or nothing the encyclopaedia will admit to.",
   notSent: "Not sent. I'll assume you thought better of it.",
   diaryShut: "The diary and the reminders are shut to me; the telephone hasn't given me leave. The particulars are below stairs.",
   fellOver: "Something has gone wrong below stairs. I've made a note of it; the particulars are there."
@@ -604,6 +605,8 @@ async function context(history) {
   const acts = J.acts.slice(-8);
   if (acts.length) items.push("Recently done for him:\n" + acts.map(a => `- (${a.at.slice(0, 10)}) ${a.t}`).join("\n"));
   items.push("Apps he can be brought: " + S.apps.map(a => a.n).join(", ") + ".");
+  const fact = onThisDayUsable(readCache());
+  if (fact) items.push("An historical note for today, for when he asks for something or nothing in particular, and never as trivia: " + fact);
   const proj = projectSummary(1500);
   if (proj) items.push("His own records, from his apps:\n" + proj);
   if (older.length) items.push("Older notes, oldest first:\n" + older.map(line).join("\n"));
@@ -820,9 +823,52 @@ function refreshTray() {
   trayWork = (async () => {
     const cache = readCache();
     try { await outlook(cache); writeCache(cache); } catch (e) {}
+    try { await fetchOnThisDay(cache); writeCache(cache); } catch (e) {}
     try { await refreshPapers(cache); } catch (e) {}
   })().then(() => { trayWork = null; }, () => { trayWork = null; });
   return trayWork;
+}
+
+// ───────────────────────── On this day ─────────────────────────
+// One historical note a day, from Wikipedia, no key needed. Fetched by the
+// app with the rest of the tray and kept for the day. Offered to the brief
+// only when the day is quiet, and to you whenever you ask. Never trivia.
+const ON_THIS_DAY_PREFER = /\b(Ireland|Irish|Dublin|Belfast|Cork|Galway|Sligo|Limerick|Ulster|Munster|Leinster|Connacht|computer|computing|telephone|telegraph|wireless|radio|television|internet|software|electric|electricity|engine|patent|invented|invention|satellite|rocket|spacecraft|aircraft|aeroplane|flight|railway|ship|ships|sailed|sails|sail|fleet|navy|naval|voyage|harbour|lighthouse|submarine|vessel|liner|maritime)\b/i;
+function dayKey(d) { d = d || new Date(); return `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+async function fetchOnThisDay(cache) {
+  cache = cache || readCache();
+  if (cache.onThisDay && cache.onThisDay.day === dayKey()) return cache.onThisDay;
+  const [mm, dd] = dayKey().split("-");
+  const req = new Request(`https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/selected/${mm}/${dd}`);
+  req.timeoutInterval = FEED_TIMEOUT; req.headers = { "User-Agent": "Valet (Scriptable, personal use)", "Accept": "application/json" };
+  const j = await req.loadJSON();
+  const all = ((j && j.selected) || []).filter(e => e && e.text && typeof e.year === "number");
+  if (!all.length) throw new Error("nothing selected for the day");
+  const mild = all.filter(e => !GRAVE.test(e.text));                          // not a massacre, to fill a quiet afternoon
+  const events = mild.length ? mild : all;
+  const preferred = events.filter(e => ON_THIS_DAY_PREFER.test(e.text));   // Irish, technological or maritime, else the oldest
+  const e = (preferred.length ? preferred : events).slice().sort((a, b) => a.year - b.year)[0];
+  let text = String(e.text).trim().replace(/\s+/g, " ").replace(/\.$/, "");
+  text = text.replace(/^(The|A|An)\b/, m => m.toLowerCase());
+  const year = e.year < 0 ? `${-e.year} BC` : String(e.year);
+  cache.onThisDay = { day: dayKey(), year: e.year, text, line: `On this day in ${year}, ${text}.`, at: new Date().toISOString() };
+  return cache.onThisDay;
+}
+function onThisDayUsable(cache) { return cache.onThisDay && cache.onThisDay.day === dayKey() ? cache.onThisDay.line : ""; }
+async function onThisDayLine() {
+  try { const cache = readCache(); const o = await fetchOnThisDay(cache); writeCache(cache); return o.line; }
+  catch (e) { fault("On this day", e && e.message || e); return P.nothingOnThisDay; }
+}
+// A quiet day: nothing pressing in the diary, no more than one reminder,
+// the news thin, and nothing grave in the headlines. Only then is the
+// note offered, and only as one clause.
+const GRAVE = /\b(die|dies|died|death|deaths|dead|killed|killing|kills|murder|murdered|shot|stabbed|crash|crashes|funeral|suicide|massacre|bomb|bombing|war|attack|terror|hospitalised|cancer|missing|drowned|tragedy)\b/i;
+function quietDay(today, due, pick) {
+  const pressing = (today || []).some(e => !e.isAllDay);
+  const headlines = pick ? pick.items.concat(pick.extra ? [pick.extra] : []) : [];
+  const thin = headlines.length <= 2;
+  const grave = headlines.some(i => GRAVE.test(i.title));
+  return !pressing && (due || []).length <= 1 && thin && !grave;
 }
 // What the widget may use: a tray stocked in the last twelve hours, weather
 // from the last three. Older than that and it says nothing, quietly.
@@ -1038,6 +1084,9 @@ async function handle(text) {
     await addEvent(w.rest, w.date, w.hasTime);
     return await tell(`${P.noted} ${cap(w.rest)}, ${niceDay(w.date)}${w.hasTime ? " at " + niceTime(w.date) : ""}.`);
   }
+
+  // Something to say when asked for nothing in particular
+  if (/^(anything (on|for) (this day|today)|on this day|what happened (on this day|today in history)|tell me something|say something|anything (interesting|of note))\b/.test(low)) return await tell(await onThisDayLine());
 
   // This edition
   if (/^(what('s| is| has) (new|changed)|what changed)\b/.test(low)) return await tell(P.changesIntro + " " + CHANGES.join(" "));
@@ -1567,7 +1616,8 @@ async function wentWrong() {
 
 const CHANGES = [
   "The widget no longer fetches anything. I stock the tray, papers and weather, when you open me, when you open the papers, when you ask me to read aloud, or when an automation runs me with the word refresh; the widget only reads what's there. Every paper is sent for at once, six seconds each, and the tray fills as they arrive.",
-  "The newsagent says how many papers you take and how long the last full restocking took."
+  "The newsagent says how many papers you take and how long the last full restocking took.",
+  "On a quiet day, with nothing pressing, no more than one reminder and thin papers, I may mention what happened on this day, once, and plainly. Ask me for something and I'll tell you regardless."
 ];
 const PAST = [
   { edition: "4.2", items: [
@@ -1901,7 +1951,7 @@ function remark(kind) {
 }
 
 // Assemble the paragraph without help.
-function composeBrief(today, tom, due, pick, wx, extra, notes, size) {
+function composeBrief(today, tom, due, pick, wx, extra, notes, size, fact) {
   const parts = [greetingWord() + ", " + addressee() + "."];
   const short = s => s.replace(/ in the (morning|afternoon|evening)/, "");
   today = leadOrder(today);                                  // the timed thing leads
@@ -1929,6 +1979,7 @@ function composeBrief(today, tom, due, pick, wx, extra, notes, size) {
   const wl = weatherLine(wx); if (wl) parts.push(wl);
   if (extra && extra.battery) parts.push(extra.battery);
   if (pw.line) parts.push(pw.line);
+  if (fact && quietDay(today, due, pick)) parts.push(fact);   // a quiet day earns one historical clause
   // Finish on a remark, unless the diary already earned one.
   if (today.length > 1) parts.push(remark("busy"));
   else if (due.length > 2) parts.push(remark("overdue"));
@@ -1937,7 +1988,8 @@ function composeBrief(today, tom, due, pick, wx, extra, notes, size) {
 }
 
 // Let him write it himself, in his own voice, over the material chosen above.
-async function writeBrief(today, tom, due, pick, wx, extra, notes, changed, size, previous) {
+async function writeBrief(today, tom, due, pick, wx, extra, notes, changed, size, previous, fact) {
+  const note = fact && quietDay(today, due, pick) ? fact : "";   // offered only when the day is quiet; the code decides, he phrases
   const words = (e, d) => eventWords(e, d).replace(/ in the (morning|afternoon|evening)/, "");
   today = leadOrder(today);
   const story = i => `${i.paper}${i.tag ? " (flagged " + i.tag + ")" : ""}: ${i.title}${i.summary ? " — " + i.summary : ""}`;
@@ -1954,6 +2006,7 @@ async function writeBrief(today, tom, due, pick, wx, extra, notes, changed, size
     extra && extra.leave ? "Timing: " + extra.leave : "",
     extra && extra.battery ? "Battery: " + extra.battery : "",
     notes && notes.length ? "Things you have noticed:\n" + notes.map(n => "- " + n).join("\n") : "",
+    note ? "An historical note, because the day is quiet: " + note : "",
     changed ? "Changed since he last looked: " + changed : "",
     today.some(e => /^now,/.test(words(e, ""))) ? "An engagement marked \"now\" is in progress: speak of it as happening, not as upcoming." : "",
     wx ? `Weather: ${wx.word || ""} ${wx.now}C, high ${wx.high}, low ${wx.low}${wx.rain != null ? ", chance of rain " + wx.rain + "%" : ""}${wx.sunset ? ", sunset " + niceTime(new Date(wx.sunset)).replace(/ in the (morning|afternoon|evening)/, "") : ""}` : "No weather available"
@@ -1969,7 +2022,9 @@ ${shape}
 
 Flowing prose, no lists, no headings. Give two or three of the news items, from different papers, in your own words, always including the one from a flagged paper when there is one. Say a new episode as "New from [podcast]: title". Never repeat a headline from the previous brief. Only state what the facts below say; invent nothing. Exactly one barb, at the end.
 
-If something is marked as changed since he last looked, lead with that rather than restating what he already knows. If you have been given things you noticed, work at most ONE of them in — the most telling — and leave the rest. An observation is worth more than another list of engagements.`;
+If something is marked as changed since he last looked, lead with that rather than restating what he already knows. If you have been given things you noticed, work at most ONE of them in — the most telling — and leave the rest. An observation is worth more than another list of engagements.
+
+If you have been given an historical note, it is because the day is quiet: nothing pressing in the diary, no more than one reminder, the news thin. Give it as one clause, plainly, in the form "On this day in 1798, the French landed at Killala." Never as trivia, never "did you know", never more than one, and never beside a death or a grave matter.`;
   const out = (await gemini(sys, facts, false)).trim();
   return size === "large" ? out.replace(/[ \t]+/g, " ").replace(/\s*\n\s*/g, "\n\n") : out.replace(/\s+/g, " ");
 }
@@ -2040,6 +2095,7 @@ async function widget() {
 
   const papers = papersUsable(cache);
   const pick = pickPapers(papers, cache.lastHeadlines, size);
+  const fact = size === "small" ? "" : onThisDayUsable(cache);
 
   // The paragraph. His own words if he can manage it, for half an hour at
   // most, and only while the facts it was written from still hold.
@@ -2064,18 +2120,18 @@ async function widget() {
   const facts = factsKey(today, due, tom);
   // The papers enter the signature by their hourly refresh, not by what was
   // picked: the pick moves on after every brief, and must not itself force one.
-  const sig = facts + "#" + (papers ? papers.at : "") + "#" + size + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "") + "#" + notes.join("|");
+  const sig = facts + "#" + (papers ? papers.at : "") + "#" + size + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "") + "#" + notes.join("|") + "#" + (fact ? dayKey() : "");
   const written = cache.briefAt && (Date.now() - new Date(cache.briefAt) < 30 * 60 * 1000) && cache.briefSig === sig;
   let wrote = false;
   if (written && cache.brief && size !== "small") text = cache.brief;
   else if (size !== "small" && Keychain.contains("valet.gemini")) {
     try {
-      text = await writeBrief(today, tom, due, pick, wx, extra, notes, changed, size, cache.lastHeadlines);
+      text = await writeBrief(today, tom, due, pick, wx, extra, notes, changed, size, cache.lastHeadlines, fact);
       cache.brief = text; cache.briefAt = new Date().toISOString(); cache.briefSig = sig; cache.briefFacts = facts; wrote = true;
     } catch (e) { text = null; }
   }
   delete cache.briefPart;
-  if (!text) { text = composeBrief(today, tom, size === "small" ? [] : due, pick, wx, extra, notes, size); wrote = size !== "small"; } // local, and never stale
+  if (!text) { text = composeBrief(today, tom, size === "small" ? [] : due, pick, wx, extra, notes, size, fact); wrote = size !== "small"; } // local, and never stale
   if (wrote && pick) cache.lastHeadlines = pick.used;           // so the next brief says something else
   if (inQuietHours()) {                                                   // quiet hours: the greeting and one sentence
     const s = text.split(". ");
@@ -2139,7 +2195,7 @@ try {
     let line = cached.brief;
     if (!recent) {
       const pick = pickPapers(cached.papers, cached.lastHeadlines, "medium");   // the same papers the widget holds
-      line = composeBrief(td, tm, du, pick, cached.wx, {}, await noticings(td, tm, du), "medium");
+      line = composeBrief(td, tm, du, pick, cached.wx, {}, await noticings(td, tm, du), "medium", onThisDayUsable(cached));
       if (pick) { cached.lastHeadlines = pick.used; writeCache(cached); }
     }
     say(line);
