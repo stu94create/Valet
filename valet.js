@@ -745,7 +745,9 @@ async function fetchPaper(feed) {
     const title = (b.match(/<title[^>]*>([\s\S]*?)<\/title>/) || [])[1];
     let link = (b.match(/<link[^>]*href="([^"]+)"/) || [])[1] || (b.match(/<link[^>]*>([\s\S]*?)<\/link>/) || [])[1] || "";
     const summary = (b.match(/<(?:description|summary|content)[^>]*>([\s\S]*?)<\/(?:description|summary|content)>/) || [])[1] || "";
-    if (title) items.push({ title: decode(title), link: decode(link), summary: decode(summary).slice(0, 220) });
+    const stamp = (b.match(/<(?:pubDate|published|updated|dc:date)[^>]*>([\s\S]*?)<\/(?:pubDate|published|updated|dc:date)>/) || [])[1];
+    const when = stamp ? new Date(decode(stamp)) : null;
+    if (title) items.push({ title: decode(title), link: decode(link), summary: decode(summary).slice(0, 220), when: when && !isNaN(when) ? when.toISOString() : null });
   }
   if (!items.length) return failed(blocks.length ? "arrived, but couldn't be read" : "arrived, but isn't a feed I recognise");
   return { paper: feed, items };
@@ -765,6 +767,61 @@ async function fetchPapers(cache) {
   cache.failing = failing;
   if (own) writeCache(cache);
   return ps;
+}
+
+// ───────────────────────── The papers, for the brief ─────────────────────────
+// Three lists, refreshed hourly and kept in the widget cache: the top story
+// from every paper; the top three from each paper he has flagged; and any
+// episode from the last two days from a feed marked as a podcast.
+async function gatherPapers(cache) {
+  const ps = await fetchPapers(cache);
+  const top = [], tagged = [], episodes = [];
+  const cutoff = Date.now() - 48 * 3600 * 1000;
+  for (const p of ps) {
+    if (!p.items.length) continue;
+    const item = i => ({ paper: p.paper.n, title: i.title, summary: i.summary || "", link: i.link || "", tag: p.paper.tag || "" });
+    if (p.paper.kind === "podcast") {
+      for (const i of p.items) if (i.when && new Date(i.when).getTime() > cutoff) episodes.push({ podcast: p.paper.n, title: i.title, when: i.when });
+      continue;
+    }
+    top.push(item(p.items[0]));
+    if (p.paper.tag) p.items.slice(0, 3).forEach(i => tagged.push(item(i)));
+  }
+  episodes.sort((a, b) => new Date(b.when) - new Date(a.when));
+  return { at: new Date().toISOString(), top, tagged, episodes: episodes.slice(0, 4) };
+}
+function papersFresh(cache) { return !!(cache.papers && cache.papers.at && (Date.now() - new Date(cache.papers.at) < 60 * 60 * 1000)); }
+// What a brief will carry, chosen here so it is the same whoever writes it
+// and so the next brief can avoid repeating it: two or three stories across
+// different papers, one of them flagged when there is one; a fourth held
+// back for the large widget's second paragraph; the new episodes. Small
+// gets one headline and no episodes. If nothing at all is new since the
+// previous brief, it is said again rather than left out.
+function pickPapers(papers, previous, size) {
+  if (!papers) return null;
+  const prev = new Set(previous || []);
+  const unseen = list => (list || []).filter(i => !prev.has(i.title));
+  let top = unseen(papers.top), tagged = unseen(papers.tagged);
+  if (!top.length && !tagged.length) { top = papers.top || []; tagged = papers.tagged || []; }
+  const want = size === "small" ? 1 : 3;
+  const items = [], papersUsed = new Set(), titles = new Set();
+  const take = i => { if (i && !titles.has(i.title)) { items.push(i); titles.add(i.title); papersUsed.add(i.paper); } };
+  if (size !== "small" && tagged.length) take(tagged[0]);
+  for (const i of top) { if (items.length >= want) break; if (!papersUsed.has(i.paper)) take(i); }
+  for (const i of top.concat(tagged)) { if (items.length >= want) break; take(i); }
+  const extra = size === "large" ? top.concat(tagged).find(i => !titles.has(i.title)) || null : null;
+  const episodes = size === "small" ? [] : unseen(papers.episodes).slice(0, 2);
+  return { items, extra, episodes, used: items.map(i => i.title).concat(extra ? [extra.title] : [], episodes.map(e => e.title)) };
+}
+// The plain form, for composeBrief and for reading aloud.
+function paperWords(pick, size) {
+  if (!pick || !pick.items.length) return { line: "", more: "" };
+  const line = pick.items.map((i, k) => (k === 0 ? `In the papers, from ${i.paper}` : `From ${i.paper}`) + (i.tag ? `, flagged ${i.tag}` : "") + `: ${i.title}.`).join(" ")
+    + pick.episodes.map(e => ` New from ${e.podcast}: ${e.title}.`).join("");
+  const more = size === "large" && pick.extra
+    ? `Also, from ${pick.extra.paper}: ${pick.extra.title}.` + (pick.extra.tag ? ` Flagged ${pick.extra.tag}, so worth a moment of your attention.` : "")
+    : "";
+  return { line, more };
 }
 
 // A short spoken form: "From RTÉ: a, b, c."
@@ -1472,7 +1529,8 @@ const CHANGES = [
   "I speak one line at a time, and I no longer talk over myself.",
   "A trip already under way is not announced as starting tomorrow, does not lead the briefing ahead of the day's engagements, and is not repeated in the evening.",
   "If the telephone won't let me at the diary, or you put a message away unsent, I say so rather than falling over.",
-  "A reminder that repeats is never called stale. If today's turn is past its time I say so; otherwise I hold my peace. Only a one-off earns 'has been there N days', counted from when it was due."
+  "A reminder that repeats is never called stale. If today's turn is past its time I say so; otherwise I hold my peace. Only a one-off earns 'has been there N days', counted from when it was due.",
+  "The papers in the brief, properly: the top story from each paper, more from the ones you've flagged, and any episode from the last two days. Two or three stories across different papers, always one you've flagged, never the same headline twice running. The large widget may add a second paragraph; the small one gets a single headline."
 ];
 const PAST = [
   { edition: "4.1", items: [
@@ -1796,7 +1854,7 @@ function remark(kind) {
 }
 
 // Assemble the paragraph without help.
-function composeBrief(today, tom, due, headline, wx, extra, notes) {
+function composeBrief(today, tom, due, pick, wx, extra, notes, size) {
   const parts = [greetingWord() + ", " + addressee() + "."];
   const short = s => s.replace(/ in the (morning|afternoon|evening)/, "");
   today = leadOrder(today);                                  // the timed thing leads
@@ -1806,38 +1864,46 @@ function composeBrief(today, tom, due, headline, wx, extra, notes) {
   } else if (today.length) {
     const e = today[0];
     parts.push(tidy(e.title) + " " + short(eventWords(e, "today")) + ".");
-    if (today.length === 2) parts.push("One more after that: " + tidy(today[1].title) + " " + short(eventWords(today[1], "all day")) + ".");
-    else if (today.length > 2) parts.push((today.length - 1) + " more after that, ending with " + tidy(today[today.length - 1].title) + ".");
+    if (size !== "small") {
+      if (today.length === 2) parts.push("One more after that: " + tidy(today[1].title) + " " + short(eventWords(today[1], "all day")) + ".");
+      else if (today.length > 2) parts.push((today.length - 1) + " more after that, ending with " + tidy(today[today.length - 1].title) + ".");
+    }
   } else if (fresh.length) {
     parts.push("Nothing today. " + tidy(fresh[0].title) + " " + short(tomorrowWords(fresh[0])) + ".");
   } else {
     parts.push(remark(new Date().getHours() >= 18 ? "evening" : "empty"));
   }
+  const pw = paperWords(pick, size);
+  if (size === "small") { if (pw.line) parts.push(pw.line); return parts.join(" "); }   // the day and one headline; nothing else fits
   if (due.length === 1) parts.push("One reminder outstanding: " + short(reminderWords(due[0], listsOf(due))) + ".");
   else if (due.length > 1) parts.push(due.length + " reminders outstanding, " + tidy(due[0].title) + " among them.");
   if (notes && notes.length) parts.push(notes[0]);
   if (extra && extra.leave) parts.push(extra.leave);
   const wl = weatherLine(wx); if (wl) parts.push(wl);
   if (extra && extra.battery) parts.push(extra.battery);
-  if (headline) parts.push("In the papers: " + headline + ".");
+  if (pw.line) parts.push(pw.line);
   // Finish on a remark, unless the diary already earned one.
   if (today.length > 1) parts.push(remark("busy"));
   else if (due.length > 2) parts.push(remark("overdue"));
   else if (today.length && new Date().getHours() >= 18) parts.push(remark("evening"));
-  return parts.join(" ");
+  return parts.join(" ") + (pw.more ? "\n\n" + pw.more : "");
 }
 
-// Let him write it himself, in his own voice, at most once an hour.
-async function writeBrief(today, tom, due, headline, wx, extra, notes, changed) {
+// Let him write it himself, in his own voice, over the material chosen above.
+async function writeBrief(today, tom, due, pick, wx, extra, notes, changed, size, previous) {
   const words = (e, d) => eventWords(e, d).replace(/ in the (morning|afternoon|evening)/, "");
   today = leadOrder(today);
+  const story = i => `${i.paper}${i.tag ? " (flagged " + i.tag + ")" : ""}: ${i.title}${i.summary ? " — " + i.summary : ""}`;
   const facts = [
     "Time of day greeting to use: " + greetingWord(),
     "Address him as: " + addressee(),
     "Today: " + (today.length ? today.map(e => tidy(e.title) + " " + words(e, "all day")).join("; ") : "nothing"),
     "Tomorrow: " + (tom.length ? tom.map(e => tidy(e.title) + " " + (continuing(e) ? "continuing, " + (spanWords(e) || "all day") : words(e, "all day"))).join("; ") : "nothing"),
     "Reminders outstanding: " + (due.length ? due.map(r => reminderWords(r, listsOf(due))).join("; ") : "none"),
-    headline ? "Top headline: " + headline : "No headline available",
+    pick && pick.items.length ? "The news for this brief, from different papers: " + pick.items.map(story).join("; ") : "No news available",
+    pick && pick.extra ? "One further headline, only for a second paragraph if there is room: " + story(pick.extra) : "",
+    pick && pick.episodes.length ? "New episodes in the last two days: " + pick.episodes.map(e => `${e.podcast}: ${e.title}`).join("; ") : "No new episodes",
+    previous && previous.length ? "Headlines given in the previous brief, not to be repeated: " + previous.join("; ") : "",
     extra && extra.leave ? "Timing: " + extra.leave : "",
     extra && extra.battery ? "Battery: " + extra.battery : "",
     notes && notes.length ? "Things you have noticed:\n" + notes.map(n => "- " + n).join("\n") : "",
@@ -1845,14 +1911,20 @@ async function writeBrief(today, tom, due, headline, wx, extra, notes, changed) 
     today.some(e => /^now,/.test(words(e, ""))) ? "An engagement marked \"now\" is in progress: speak of it as happening, not as upcoming." : "",
     wx ? `Weather: ${wx.word || ""} ${wx.now}C, high ${wx.high}, low ${wx.low}${wx.rain != null ? ", chance of rain " + wx.rain + "%" : ""}${wx.sunset ? ", sunset " + niceTime(new Date(wx.sunset)).replace(/ in the (morning|afternoon|evening)/, "") : ""}` : "No weather available"
   ].join("\n");
+  const shape = size === "large"
+    ? `Write for the large widget, up to 90 words. Order: the greeting and the day; what is outstanding; the weather only if it bears on what he is doing; the news; the new episodes; one closing dry remark. If that paragraph comes in under 60 words and you were given a further headline, add a blank line and a second short paragraph: that headline, and, if it is from a flagged paper, one sentence on why it deserves his attention. Otherwise stop. Never pad.`
+    : `Write ONE paragraph for the widget, no more than 75 words and no line breaks: the greeting, then what matters for this part of the day, the weather only if it bears on what he is doing, the news, the new episodes, and a single dry remark to finish.`;
   const sys = personaPrompt(addressee()) + `
 
 ${SHAPE[dayPart()]}
 
-Write ONE short paragraph to be read on a home screen widget: the greeting, then what matters for this part of the day, the weather only if it bears on what he is doing, the headline if there is one, and a single dry remark to finish. Flowing prose, no lists, no headings, no line breaks. Between 30 and 55 words. Only state what the facts below say; invent nothing. Exactly one barb, at the end.
+${shape}
+
+Flowing prose, no lists, no headings. Give two or three of the news items, from different papers, in your own words, always including the one from a flagged paper when there is one. Say a new episode as "New from [podcast]: title". Never repeat a headline from the previous brief. Only state what the facts below say; invent nothing. Exactly one barb, at the end.
 
 If something is marked as changed since he last looked, lead with that rather than restating what he already knows. If you have been given things you noticed, work at most ONE of them in — the most telling — and leave the rest. An observation is worth more than another list of engagements.`;
-  return (await gemini(sys, facts, false)).trim().replace(/\s+/g, " ");
+  const out = (await gemini(sys, facts, false)).trim();
+  return size === "large" ? out.replace(/[ \t]+/g, " ").replace(/\s*\n\s*/g, "\n\n") : out.replace(/\s+/g, " ");
 }
 
 // ───────────────────────── Keeping the widget honest ─────────────────────────
@@ -1917,18 +1989,13 @@ async function widget() {
     if (lvl <= 15 && !Device.isCharging()) extra.battery = lvl + " per cent on the telephone, which will limit us both.";
   }
 
-  // A headline, refreshed every three hours, on the larger sizes.
-  if (size !== "small" && S.feeds.length) {
-    const fresh = cache.headlineAt && (Date.now() - new Date(cache.headlineAt) < 3 * 3600 * 1000);
-    if (!fresh) {
-      try {
-        const ps = await fetchPapers(cache);
-        const first = ps.filter(p => p.items.length)[0];
-        if (first) { cache.headline = first.items[0].title; cache.headlineAt = new Date().toISOString(); }
-      } catch (e) {}
-    }
+  // The papers: three lists, refreshed hourly. Fetched by the larger sizes;
+  // the small one reads what is already on the tray.
+  if (size !== "small" && S.feeds.length && !papersFresh(cache)) {
+    try { cache.papers = await gatherPapers(cache); } catch (e) {}
   }
-  const headline = size === "small" ? null : cache.headline;
+  delete cache.headline; delete cache.headlineAt;
+  const pick = pickPapers(cache.papers, cache.lastHeadlines, size);
 
   // The paragraph. His own words if he can manage it, for half an hour at
   // most, and only while the facts it was written from still hold.
@@ -1951,18 +2018,21 @@ async function widget() {
   cache.state = state;
 
   const facts = factsKey(today, due, tom);
-  const sig = facts + "#" + (headline || "") + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "") + "#" + notes.join("|");
+  // The papers enter the signature by their hourly refresh, not by what was
+  // picked: the pick moves on after every brief, and must not itself force one.
+  const sig = facts + "#" + (cache.papers ? cache.papers.at : "") + "#" + size + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "") + "#" + notes.join("|");
   const written = cache.briefAt && (Date.now() - new Date(cache.briefAt) < 30 * 60 * 1000) && cache.briefSig === sig;
-  if (written && cache.brief) text = cache.brief;
+  let wrote = false;
+  if (written && cache.brief && size !== "small") text = cache.brief;
   else if (size !== "small" && Keychain.contains("valet.gemini")) {
     try {
-      text = await writeBrief(today, tom, due, headline, wx, extra, notes, changed);
-      cache.brief = text; cache.briefAt = new Date().toISOString(); cache.briefSig = sig; cache.briefFacts = facts;
+      text = await writeBrief(today, tom, due, pick, wx, extra, notes, changed, size, cache.lastHeadlines);
+      cache.brief = text; cache.briefAt = new Date().toISOString(); cache.briefSig = sig; cache.briefFacts = facts; wrote = true;
     } catch (e) { text = null; }
   }
   delete cache.briefPart;
-  if (!text) text = composeBrief(today, tom, size === "small" ? [] : due, headline, wx, extra, notes); // local, and never stale
-  if (size === "small") text = text.split(". ").slice(0, 2).join(". ") + (text.endsWith(".") ? "" : ".");
+  if (!text) { text = composeBrief(today, tom, size === "small" ? [] : due, pick, wx, extra, notes, size); wrote = size !== "small"; } // local, and never stale
+  if (wrote && pick) cache.lastHeadlines = pick.used;           // so the next brief says something else
   if (inQuietHours()) {                                                   // quiet hours: the greeting and one sentence
     const s = text.split(". ");
     text = s.slice(0, /^(Good|You're up)/.test(s[0]) ? 2 : 1).join(". ").replace(/\.?$/, ".");
@@ -2011,7 +2081,12 @@ try {
     const cached = readCache();
     const { today: td, tom: tm, due: du } = await liveFacts();
     const recent = cached.brief && cached.briefAt && (Date.now() - new Date(cached.briefAt) < 10 * 60 * 1000) && cached.briefFacts === factsKey(td, du, tm);
-    const line = recent ? cached.brief : composeBrief(td, tm, du, cached.headline, cached.wx, {}, await noticings(td, tm, du));
+    let line = cached.brief;
+    if (!recent) {
+      const pick = pickPapers(cached.papers, cached.lastHeadlines, "medium");   // the same papers the widget holds
+      line = composeBrief(td, tm, du, pick, cached.wx, {}, await noticings(td, tm, du), "medium");
+      if (pick) { cached.lastHeadlines = pick.used; writeCache(cached); }
+    }
     say(line);
     const a = new Alert(); a.message = line; a.addAction("Very good"); a.addAction("Go on then");
     if ((await a.present()) === 1) { await scheduleNotices(); await home(); }
