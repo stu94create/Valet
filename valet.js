@@ -294,10 +294,18 @@ function reminderTimed(r) {
   if (typeof r.dueDateIncludesTime === "boolean") return r.dueDateIncludesTime;
   return !!(r.dueDate.getHours() || r.dueDate.getMinutes());
 }
+// A reminder that repeats is never stale; the only lateness that means
+// anything is today's turn being past its time.
+function repeating(r) { const rules = r && r.recurrenceRules; return Array.isArray(rules) && rules.length > 0; }
 function dueWords(r) {
   if (!r.dueDate) return "no date set";
   const d = new Date(r.dueDate), now = new Date(), timed = reminderTimed(r);
   const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+  if (repeating(r)) {
+    if (sameDay(d, now)) return timed ? (d < now ? `overdue since ${clockWords(d)}` : `due ${clockWords(d)}`) : "due today";
+    if (d < dayStart) return `repeating, last due ${niceDay(d)}`;
+    return timed ? `due ${niceDay(d)} at ${clockWords(d)}` : `due ${niceDay(d)}`;
+  }
   if (timed && d < now) return sameDay(d, now) ? `overdue, was due ${clockWords(d)}` : `overdue since ${niceDay(d)}`;
   if (!timed && d < dayStart) return `overdue since ${niceDay(d)}`;
   if (sameDay(d, now)) return timed ? `due ${clockWords(d)}` : "due today";
@@ -1463,7 +1471,8 @@ const CHANGES = [
   "Times are checked: thirty minutes is a duration, not half past twenty-nine. A reminder with no date stays undated rather than being fixed for nine in the morning.",
   "I speak one line at a time, and I no longer talk over myself.",
   "A trip already under way is not announced as starting tomorrow, does not lead the briefing ahead of the day's engagements, and is not repeated in the evening.",
-  "If the telephone won't let me at the diary, or you put a message away unsent, I say so rather than falling over."
+  "If the telephone won't let me at the diary, or you put a message away unsent, I say so rather than falling over.",
+  "A reminder that repeats is never called stale. If today's turn is past its time I say so; otherwise I hold my peace. Only a one-off earns 'has been there N days', counted from when it was due."
 ];
 const PAST = [
   { edition: "4.1", items: [
@@ -1654,12 +1663,16 @@ async function birthdaysSoon() {
 }
 
 // Reminders that have been sitting there a while.
+// One-off reminders only. Age is counted from the due date when there is
+// one, and from creation only for the undated. Repeating ones never qualify.
 function staleReminders(due) {
   const out = [];
   for (const r of due || []) {
-    if (!r.creationDate) continue;
-    const age = Math.round((Date.now() - new Date(r.creationDate)) / 86400000);
-    if (age >= 7) out.push({ title: tidy(r.title), days: age });
+    if (repeating(r)) continue;
+    const since = r.dueDate ? new Date(r.dueDate) : r.creationDate ? new Date(r.creationDate) : null;
+    if (!since || isNaN(since)) continue;
+    const age = Math.floor((Date.now() - since) / 86400000);
+    if (age >= 7) out.push({ title: tidy(r.title), days: age, overdue: !!r.dueDate });
   }
   return out.sort((a, b) => b.days - a.days).slice(0, 1);
 }
@@ -1733,7 +1746,7 @@ async function noticings(today, tom, due) {
   const bits = [];
   for (const c of await countdowns()) bits.push(`${c.days} days until ${c.title}.`);
   for (const b of await birthdaysSoon()) bits.push(b.days === 0 ? `${b.name}'s birthday is today.` : b.days === 1 ? `${b.name}'s birthday is tomorrow.` : `${b.name}'s birthday in ${b.days} days.`);
-  for (const s of staleReminders(due)) bits.push(`The reminder "${s.title}" has been there ${s.days} days.`);
+  for (const s of staleReminders(due)) bits.push(s.overdue ? `The reminder "${s.title}" has been overdue ${s.days} days.` : `The reminder "${s.title}" has been there ${s.days} days.`);
   for (const p of await patterns(today, tom)) bits.push(p);
   const hw = timesheetWeek();
   if (hw && hw.entries) {
