@@ -2089,7 +2089,7 @@ function paintCard(w) {
 // UIKit gives the system face if a named one is missing, silently; there is
 // no way to ask. Iowan Old Style ships with iOS, so this should hold.
 const serif = (size, italic) => new Font(italic ? LOOK.serifItalic : LOOK.serif, size);
-const smallCaps = s => String(s).toUpperCase().split("").join(" ");   // letter-spaced by hand; widgets have no tracking
+const smallCaps = s => String(s).toUpperCase();   // capitals only: spacing the letters by hand made VoiceOver spell them out
 // The glanceable line: figures and short forms only, never the paragraph's words.
 function statusStrip(wx, due, today, tom) {
   const bits = [];
