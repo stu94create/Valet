@@ -3,7 +3,7 @@
 // Add to Siri from the script's settings so "Hey Siri, <name>" opens him.
 // Optional: add a Scriptable widget and choose this script for a standing brief.
 
-const VERSION = "4.2";
+const VERSION = "4.3";
 
 // ───────────────────────── Phrase book ─────────────────────────
 const P = {
@@ -733,7 +733,7 @@ function decode(s) {
 }
 // Fetch one feed → { paper, items: [{title, link, summary}] }. RSS and Atom both.
 async function fetchPaper(feed) {
-  const r = new Request(feed.u); r.timeoutInterval = 8;
+  const r = new Request(feed.u); r.timeoutInterval = FEED_TIMEOUT;
   let xml = "";
   const failed = error => ({ paper: feed, items: [], error });
   try { xml = await r.loadString(); } catch (e) { return failed("no reply: " + (e.message || e)); }
@@ -753,32 +753,31 @@ async function fetchPaper(feed) {
   return { paper: feed, items };
 }
 // A paper that fails once is weather; one that fails three times running is
-// worth a note below stairs. The tally lives in the widget cache; pass the
-// cache in if you already hold it, so nobody's copy overwrites another's.
-async function fetchPapers(cache) {
-  const ps = await Promise.all(S.feeds.map(fetchPaper));
-  const own = !cache; if (own) cache = readCache();
+// worth a note below stairs. The tally lives in the widget cache.
+function tallyFailures(ps, cache) {
   const failing = cache.failing || {};
   for (const p of ps) {
+    if (!p) continue;
     if (!p.error) { delete failing[p.paper.u]; continue; }
     failing[p.paper.u] = (failing[p.paper.u] || 0) + 1;
     if (failing[p.paper.u] === 3) fault("The newsagent", `${p.paper.n}: ${p.error}, three times running`);
   }
   cache.failing = failing;
-  if (own) writeCache(cache);
-  return ps;
 }
 
-// ───────────────────────── The papers, for the brief ─────────────────────────
-// Three lists, refreshed hourly and kept in the widget cache: the top story
+// ───────────────────────── Keeping the tray stocked ─────────────────────────
+// The app fetches; the widget only reads. Every paper is sent for at once,
+// six seconds each, and the tray is restocked as each arrives, so one slow
+// paper never holds up the rest. Three lists come out of it: the top story
 // from every paper; the top three from each paper he has flagged; and any
 // episode from the last two days from a feed marked as a podcast.
-async function gatherPapers(cache) {
-  const ps = await fetchPapers(cache);
+const FEED_TIMEOUT = 6;
+let trayWork = null;                         // the restocking in hand, so he can finish it before leaving
+function shelve(ps) {
   const top = [], tagged = [], episodes = [];
   const cutoff = Date.now() - 48 * 3600 * 1000;
   for (const p of ps) {
-    if (!p.items.length) continue;
+    if (!p || !p.items || !p.items.length) continue;
     const item = i => ({ paper: p.paper.n, title: i.title, summary: i.summary || "", link: i.link || "", tag: p.paper.tag || "" });
     if (p.paper.kind === "podcast") {
       for (const i of p.items) if (i.when && new Date(i.when).getTime() > cutoff) episodes.push({ podcast: p.paper.n, title: i.title, when: i.when });
@@ -788,9 +787,52 @@ async function gatherPapers(cache) {
     if (p.paper.tag) p.items.slice(0, 3).forEach(i => tagged.push(item(i)));
   }
   episodes.sort((a, b) => new Date(b.when) - new Date(a.when));
-  return { at: new Date().toISOString(), top, tagged, episodes: episodes.slice(0, 4) };
+  return { top, tagged, episodes: episodes.slice(0, 4) };
 }
-function papersFresh(cache) { return !!(cache.papers && cache.papers.at && (Date.now() - new Date(cache.papers.at) < 60 * 60 * 1000)); }
+// Resolves with the value, or with fallback() once the seconds are up.
+function withinSeconds(p, secs, fallback) {
+  return new Promise(resolve => {
+    let done = false;
+    const t = Timer.schedule(secs * 1000, false, () => { if (!done) { done = true; resolve(fallback()); } });
+    p.then(v => { if (!done) { done = true; t.invalidate(); resolve(v); } }, () => { if (!done) { done = true; t.invalidate(); resolve(fallback()); } });
+  });
+}
+async function refreshPapers(cache) {
+  cache = cache || readCache();
+  const started = Date.now(), results = new Array(S.feeds.length).fill(null);
+  const write = complete => {
+    const done = results.filter(Boolean);
+    const took = complete ? Date.now() - started : (cache.papers && cache.papers.took) || null;
+    cache.papers = Object.assign(shelve(done), { at: new Date().toISOString(), complete, took, feeds: S.feeds.length, arrived: done.length });
+    writeCache(cache);
+  };
+  await Promise.all(S.feeds.map((feed, i) =>
+    withinSeconds(fetchPaper(feed), FEED_TIMEOUT + 0.5, () => ({ paper: feed, items: [], error: "no reply in time" }))
+      .then(p => { results[i] = p; write(false); })));
+  tallyFailures(results, cache);
+  write(true);
+  return results;
+}
+// Papers and weather together, once at a time. Callers that don't need the
+// answer leave it running; the script waits for it before it leaves.
+function refreshTray() {
+  if (trayWork) return trayWork;
+  trayWork = (async () => {
+    const cache = readCache();
+    try { await outlook(cache); writeCache(cache); } catch (e) {}
+    try { await refreshPapers(cache); } catch (e) {}
+  })().then(() => { trayWork = null; }, () => { trayWork = null; });
+  return trayWork;
+}
+// What the widget may use: a tray stocked in the last twelve hours, weather
+// from the last three. Older than that and it says nothing, quietly.
+function papersUsable(cache) { return cache.papers && cache.papers.at && (Date.now() - new Date(cache.papers.at) < 12 * 3600 * 1000) ? cache.papers : null; }
+function weatherUsable(cache) { return cache.wx && cache.wxAt && (Date.now() - new Date(cache.wxAt) < 3 * 3600 * 1000) ? cache.wx : null; }
+function trayReport() {
+  const p = readCache().papers;
+  if (!p || !p.complete || !p.took) return `${S.feeds.length} papers taken. The tray hasn't been stocked yet; open the papers, or run me with the word refresh.`;
+  return `${S.feeds.length} papers taken. The last full restocking took ${(p.took / 1000).toFixed(1)} seconds, ${whenAgo(p.at)}.`;
+}
 // What a brief will carry, chosen here so it is the same whoever writes it
 // and so the next brief can avoid repeating it: two or three stories across
 // different papers, one of them flagged when there is one; a fourth held
@@ -847,7 +889,7 @@ async function papers(spokenOnly) {
 }
 async function papersInner(spokenOnly) {
   let ps;
-  try { ps = await fetchPapers(); } catch (e) { fault("The newsagent", e && e.message || e); return await tell(P.papersEmpty + " " + P.detailsBelow); }
+  try { ps = await refreshPapers(); } catch (e) { fault("The newsagent", e && e.message || e); return await tell(P.papersEmpty + " " + P.detailsBelow); }
   const any = ps.some(p => p.items.length);
   if (!any) return await tell(P.papersEmpty + " " + P.detailsBelow);
   const hasKey = Keychain.contains("valet.gemini");
@@ -1365,6 +1407,7 @@ async function recordsScreen() {
 async function newsagent() {
   const table = new UITable(); table.showSeparators = true;
   table.addRow(row("The papers he takes. Any RSS or Atom feed will do — most news sites have one.", null, null));
+  table.addRow(infoRow(trayReport()));
   let next = null;
   table.addRow(row("Take another paper", "One address at a time", () => { next = () => editFeed(null); }));
   table.addRow(row("Import a list", "An OPML file from Lire, Overcast or similar", () => { next = importOPML; }));
@@ -1523,6 +1566,11 @@ async function wentWrong() {
 }
 
 const CHANGES = [
+  "The widget no longer fetches anything. I stock the tray, papers and weather, when you open me, when you open the papers, when you ask me to read aloud, or when an automation runs me with the word refresh; the widget only reads what's there. Every paper is sent for at once, six seconds each, and the tray fills as they arrive.",
+  "The newsagent says how many papers you take and how long the last full restocking took."
+];
+const PAST = [
+  { edition: "4.2", items: [
   "Overdue reminders now reach the front door and the briefing, not only the full list. You may find one or two you'd forgotten. That is rather the point.",
   "I listen more carefully. A short word is no longer taken for an app or a screen, 'note' means remember, and 'tell me' is a question rather than a message to somebody called Me.",
   "Times are checked: thirty minutes is a duration, not half past twenty-nine. A reminder with no date stays undated rather than being fixed for nine in the morning.",
@@ -1531,8 +1579,7 @@ const CHANGES = [
   "If the telephone won't let me at the diary, or you put a message away unsent, I say so rather than falling over.",
   "A reminder that repeats is never called stale. If today's turn is past its time I say so; otherwise I hold my peace. Only a one-off earns 'has been there N days', counted from when it was due.",
   "The papers in the brief, properly: the top story from each paper, more from the ones you've flagged, and any episode from the last two days. Two or three stories across different papers, always one you've flagged, never the same headline twice running. The large widget may add a second paragraph; the small one gets a single headline."
-];
-const PAST = [
+  ] },
   { edition: "4.1", items: [
     "The widget keeps up. Every draw starts from the diary as it stands: nothing that has finished, and anything under way said as now. I ask the telephone to redraw at the moments that matter, and my written paragraph is dropped the instant it stops being true. It says when I last looked, so you know.",
     "Reminders are fuller: when they're due, in clock words; overdue said plainly; the list, when more than one is in play; the priority, when it's high. Tap one and I read it out, notes and all, and offer to tick it off or put it off until later today or tomorrow.",
@@ -1610,7 +1657,7 @@ async function outlook(cache) {
     const url = "https://api.open-meteo.com/v1/forecast?latitude=" + lat.toFixed(3) + "&longitude=" + lon.toFixed(3) +
       "&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset" +
       "&timezone=auto&forecast_days=1";
-    const req = new Request(url); req.timeoutInterval = 12;
+    const req = new Request(url); req.timeoutInterval = FEED_TIMEOUT;
     const j = await req.loadJSON();
     if (!j || !j.current) throw new Error("no reading");
     const wx = {
@@ -1980,8 +2027,10 @@ async function widget() {
 
   const { today, tom, due } = await liveFacts();   // fresh every draw; nothing finished, nothing cached
 
+  // The widget fetches nothing. It reads the tray the app has stocked; an
+  // empty or stale tray means a brief without papers or weather, said nothing of.
   const cache = readCache();
-  const wx = size === "small" ? null : await outlook(cache);   // into this cache, which is written below
+  const wx = size === "small" ? null : weatherUsable(cache);
   const extra = {};
   if (size !== "small") {
     extra.leave = await leaveBy(today);
@@ -1989,13 +2038,8 @@ async function widget() {
     if (lvl <= 15 && !Device.isCharging()) extra.battery = lvl + " per cent on the telephone, which will limit us both.";
   }
 
-  // The papers: three lists, refreshed hourly. Fetched by the larger sizes;
-  // the small one reads what is already on the tray.
-  if (size !== "small" && S.feeds.length && !papersFresh(cache)) {
-    try { cache.papers = await gatherPapers(cache); } catch (e) {}
-  }
-  delete cache.headline; delete cache.headlineAt;
-  const pick = pickPapers(cache.papers, cache.lastHeadlines, size);
+  const papers = papersUsable(cache);
+  const pick = pickPapers(papers, cache.lastHeadlines, size);
 
   // The paragraph. His own words if he can manage it, for half an hour at
   // most, and only while the facts it was written from still hold.
@@ -2020,7 +2064,7 @@ async function widget() {
   const facts = factsKey(today, due, tom);
   // The papers enter the signature by their hourly refresh, not by what was
   // picked: the pick moves on after every brief, and must not itself force one.
-  const sig = facts + "#" + (cache.papers ? cache.papers.at : "") + "#" + size + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "") + "#" + notes.join("|");
+  const sig = facts + "#" + (papers ? papers.at : "") + "#" + size + "#" + (wx ? wx.word + wx.now : "") + "#" + (extra.leave || "") + "#" + (extra.battery ? "low" : "") + "#" + notes.join("|");
   const written = cache.briefAt && (Date.now() - new Date(cache.briefAt) < 30 * 60 * 1000) && cache.briefSig === sig;
   let wrote = false;
   if (written && cache.brief && size !== "small") text = cache.brief;
@@ -2037,7 +2081,12 @@ async function widget() {
     const s = text.split(". ");
     text = s.slice(0, /^(Good|You're up)/.test(s[0]) ? 2 : 1).join(". ").replace(/\.?$/, ".");
   }
-  writeCache(cache);
+  // Write only what is the widget's to write, onto whatever the app has
+  // put on the tray since this draw began.
+  const latest = readCache();
+  for (const k of ["brief", "briefAt", "briefSig", "briefFacts", "state", "lastHeadlines"]) if (cache[k] !== undefined) latest[k] = cache[k];
+  delete latest.briefPart; delete latest.headline; delete latest.headlineAt;
+  writeCache(latest);
 
   const body = w.addText(text);
   body.font = Font.systemFont(size === "small" ? 13 : size === "large" ? 17 : 15);
@@ -2074,10 +2123,16 @@ try {
   } else if (!S.introduced) {
     await introduce(false);
     await home();
+  } else if (args.shortcutParameter === "refresh" || (args.queryParameters && args.queryParameters.refresh)) {
+    // Run by an automation with the word "refresh": stock the tray, papers
+    // and weather, and leave without a word. The widget reads it next time.
+    await refreshTray();
   } else if (args.queryParameters && args.queryParameters.read) {
     // Tapped "Read aloud" on the widget: say the brief and withdraw. His
     // written paragraph only if it is recent and still true; otherwise a
-    // fresh line from the facts as they stand.
+    // fresh line from the facts as they stand. The tray is restocked
+    // meanwhile, for next time.
+    refreshTray();
     const cached = readCache();
     const { today: td, tom: tm, due: du } = await liveFacts();
     const recent = cached.brief && cached.briefAt && (Date.now() - new Date(cached.briefAt) < 10 * 60 * 1000) && cached.briefFacts === factsKey(td, du, tm);
@@ -2099,7 +2154,8 @@ try {
     await papers(false);
   } else {
     await scheduleNotices();
-    warmCache(); // in the background, while you talk to him
+    warmCache();    // in the background, while you talk to him
+    refreshTray();  // likewise: the papers and the weather, for the widget
     await home();
   }
 } catch (e) {
@@ -2111,4 +2167,5 @@ try {
   }
 }
 try { await lastSpeech; } catch (e) {}
+if (trayWork) { try { await trayWork; } catch (e) {} }   // let the restocking finish before he leaves
 Script.complete();
