@@ -3,7 +3,7 @@
 // Add to Siri from the script's settings so "Hey Siri, <name>" opens him.
 // Optional: add a Scriptable widget and choose this script for a standing brief.
 
-const VERSION = "3.1";
+const VERSION = "3.2";
 
 // ───────────────────────── Phrase book ─────────────────────────
 const P = {
@@ -767,27 +767,6 @@ async function gemini(sys, text, wantJson) {
     } catch (e) { lastMachineError = "Google replied, but not with words I could use."; throw new Error(lastMachineError); }
   }
   throw new Error(lastMachineError || "No model would answer.");
-}
-
-// Gemini: turns a sentence into one of his actions.
-async function think(text) {
-  const sys = `You translate a spoken instruction to a phone valet into ONE JSON object and nothing else. Today is ${new Date().toDateString()}. Schema: {"intent": one of "whatsapp","text","email","call","remind","event","events","reminders","news","fetch","unknown", "who": string|null, "body": string|null, "when": natural language time or null, "app": string|null}. For "events" set when to "today","tomorrow" or "week".`;
-  let j;
-  try { const out = await gemini(sys, text, true); j = JSON.parse(out.replace(/```json|```/g, "").trim()); }
-  catch (e) { return await tell(P.machineFailed + " " + (lastMachineError || e.message || "")); }
-  switch (j.intent) {
-    case "whatsapp": return await sendWhatsApp(j.who || "", j.body || "");
-    case "text": return await sendText(j.who || "", j.body || "");
-    case "email": return await sendEmail(j.who || "", j.body || "");
-    case "call": return await ringUp(j.who || "");
-    case "remind": { const w = parseWhen(j.when || ""); await addReminder(j.body || text, w.date, w.hasTime); return await tell(`${P.noted} ${cap(j.body || text)}, ${niceDay(w.date)}.`); }
-    case "event": { const w = parseWhen(j.when || ""); await addEvent(j.body || text, w.date, w.hasTime); return await tell(`${P.noted} ${cap(j.body || text)}, ${niceDay(w.date)}${w.hasTime ? " at " + niceTime(w.date) : ""}.`); }
-    case "events": return await handle("what's on " + (j.when || "today"));
-    case "reminders": return await remindersTable();
-    case "news": return await papers(true);
-    case "fetch": { const a = findApp(j.app || ""); return a ? await fetchApp(a) : await tell(P.noIdea); }
-    default: return await tell(P.noIdea);
-  }
 }
 
 // ───────────────────────── Screens ─────────────────────────
