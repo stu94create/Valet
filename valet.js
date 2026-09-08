@@ -3,7 +3,7 @@
 // Add to Siri from the script's settings so "Hey Siri, <name>" opens him.
 // Optional: add a Scriptable widget and choose this script for a standing brief.
 
-const VERSION = "4.4.1";
+const VERSION = "4.6";
 
 // ───────────────────────── Phrase book ─────────────────────────
 const P = {
@@ -63,6 +63,8 @@ const P = {
   putOff: w => `Put off until ${w}. It will keep; they always do.`,
   leftIt: "Left where it was.",
   nothingOnThisDay: "Nothing of note happened on this day, or nothing the encyclopaedia will admit to.",
+  wirelessEmpty: "Nothing new on the wireless. Even they must rest.",
+  studyEmpty: "Nothing in your records that I can read. Leave a file in the projects folder and I shall.",
   notSent: "Not sent. I'll assume you thought better of it.",
   diaryShut: "The diary and the reminders are shut to me; the telephone hasn't given me leave. The particulars are below stairs.",
   fellOver: "Something has gone wrong below stairs. I've made a note of it; the particulars are there."
@@ -783,7 +785,7 @@ function shelve(ps) {
     if (!p || !p.items || !p.items.length) continue;
     const item = i => ({ paper: p.paper.n, title: i.title, summary: i.summary || "", link: i.link || "", tag: p.paper.tag || "" });
     if (p.paper.kind === "podcast") {
-      for (const i of p.items) if (i.when && new Date(i.when).getTime() > cutoff) episodes.push({ podcast: p.paper.n, title: i.title, when: i.when });
+      for (const i of p.items) if (i.when && new Date(i.when).getTime() > cutoff) episodes.push({ podcast: p.paper.n, title: i.title, when: i.when, link: i.link || "" });
       continue;
     }
     top.push(item(p.items[0]));
@@ -1391,6 +1393,7 @@ async function belowStairs() {
   table.addRow(headerRow("Housekeeping"));
   table.addRow(actionRow("What went wrong", (() => { const n = readFaults().length; return n ? `${n} on record` : "Nothing on record"; })(), () => { next = wentWrong; }));
   table.addRow(actionRow("What's changed", `Edition ${VERSION}`, () => { next = whatsChanged; }));
+  table.addRow(actionRow("His cards", `${Object.keys(CARDS).length} to choose from`, () => { next = cardsScreen; }));
   table.addRow(destructiveRow("Forget the routine he's learned", "Clears what he knows of your habits. He will ask first", () => { next = async () => {
     const a = new Alert(); a.message = "Forget the routine? I shall start observing afresh."; a.addDestructiveAction("Forget it"); a.addCancelAction("Keep it");
     if ((await a.present()) === 0) { S.routine = {}; S.habits = []; delete S.usualDay; save(); say(P.forgot); }
@@ -1614,11 +1617,15 @@ async function wentWrong() {
 }
 
 const CHANGES = [
+  "A family of cards. Put a word in a widget's parameter — diary, reminders, papers, wireless or study — and it draws that instead of the brief; leave it empty and you get the brief as ever. Drag several onto each other and you may swipe between them. They are listed below stairs, under his cards.",
+];
+const PAST = [
+  { edition: "4.4", items: [
+  "A dark card, in one hand: ivory serif on near-black, a brass rule and signature, and nothing louder than the paragraph.",
   "The widget no longer fetches anything. I stock the tray, papers and weather, when you open me, when you open the papers, when you ask me to read aloud, or when an automation runs me with the word refresh; the widget only reads what's there. Every paper is sent for at once, six seconds each, and the tray fills as they arrive.",
   "The newsagent says how many papers you take and how long the last full restocking took.",
   "On a quiet day, with nothing pressing in the diary and no more than one reminder, I may mention what happened on this day, once, and plainly. Ask me for something and I'll tell you regardless."
-];
-const PAST = [
+  ] },
   { edition: "4.2", items: [
   "Overdue reminders now reach the front door and the briefing, not only the full list. You may find one or two you'd forgotten. That is rather the point.",
   "I listen more carefully. A short word is no longer taken for an app or a screen, 'note' means remember, and 'tell me' is a question rather than a message to somebody called Me.",
@@ -1649,6 +1656,14 @@ async function whatsChanged() {
   table.addRow(infoRow(`${P.changesIntro} Edition ${VERSION}.`));
   CHANGES.forEach(c => table.addRow(infoRow(c)));
   for (const past of PAST) { table.addRow(headerRow(`Edition ${past.edition}`)); past.items.forEach(c => table.addRow(infoRow(c))); }
+  await table.present(false);
+}
+
+// The words a widget will answer to, for when you've forgotten them.
+async function cardsScreen() {
+  const table = new UITable(); table.showSeparators = true;
+  table.addRow(infoRow("Add a Scriptable widget, choose this script, and put one of these words in its Parameter. Leave it empty for the standing brief. Several widgets dragged onto each other make a stack you can swipe."));
+  Object.keys(CARDS).forEach(k => table.addRow(infoRow(k, CARDS[k])));
   await table.present(false);
 }
 
@@ -2105,11 +2120,73 @@ function statusStrip(wx, due, today, tom) {
   return bits.join(" · ");
 }
 
+// ───────────────────────── The family of cards ─────────────────────────
+// One hand, several cards. The widget's parameter says which; without one
+// he gives the standing brief, exactly as before. All share the card, the
+// fonts, the rule and the signature. None of them fetches anything.
+const CARDS = {
+  brief: "The standing brief. Leave the parameter empty for this",
+  diary: "The next three engagements",
+  reminders: "The four most pressing",
+  papers: "Four headlines, and any new episode",
+  wireless: "New episodes from the last two days",
+  study: "Your hours, and the practice"
+};
+// A row of fixed height, so nothing can be squeezed onto its neighbour.
+function cardLine(w, h, fill) {
+  const s = w.addStack(); s.layoutHorizontally(); s.centerAlignContent(); s.size = new Size(0, h);
+  fill(s); s.addSpacer(); return s;
+}
+function todayWords() { const d = new Date(); return `${DAY_NAMES[d.getDay()]} ${d.getDate()} ${MONTH_NAMES[d.getMonth()]}`; }
+// Header, then the status strip if the brief supplied one, then the brass
+// hairline. Drawn in that order, each on its own row.
+function cardTop(w, title, size, strip) {
+  cardLine(w, 14, s => { const h = s.addText(smallCaps(title)); h.font = Font.mediumSystemFont(11); h.textColor = muted(); h.lineLimit = 1; h.minimumScaleFactor = 0.8; });
+  if (size === "small") { w.addSpacer(6); return; }
+  if (strip) { w.addSpacer(4); cardLine(w, 14, s => { const st = s.addText(strip); st.font = Font.regularSystemFont(11); st.textColor = muted(); st.lineLimit = 1; st.minimumScaleFactor = 0.85; }); }
+  w.addSpacer(8);
+  cardLine(w, 1, s => { s.backgroundColor = brass(0.25); s.cornerRadius = 0.5; });
+  w.addSpacer(10);
+}
+// The foot of every card: the signature in brass, the hour he last looked
+// on the large card, and the Read-aloud pill on the brief alone.
+function cardFoot(w, size, pill) {
+  w.addSpacer();
+  const foot = w.addStack(); foot.layoutHorizontally(); foot.bottomAlignContent();
+  const left = foot.addStack(); left.layoutVertically();
+  const signature = left.addText("— " + S.valet); signature.font = serif(12, true); signature.textColor = brass();
+  if (size === "large") { const looked = left.addText(lookedAt()); looked.font = Font.regularSystemFont(10); looked.textColor = muted(); looked.textOpacity = 0.6; }
+  if (pill && size !== "small") {
+    foot.addSpacer();
+    const p = foot.addStack();
+    p.url = "scriptable:///run/" + encodeURIComponent(Script.name()) + "?read=1";   // opens him and he reads the brief aloud, nothing else
+    p.setPadding(4, 10, 4, 10); p.cornerRadius = 11; p.borderWidth = 1; p.borderColor = new Color(LOOK.muted, 0.4);
+    const r = p.addText("Read aloud"); r.font = Font.mediumSystemFont(11); r.textColor = ink();
+  }
+}
+// One entry on a list card: the thing in serif, what there is to say about
+// it beneath in muted, the whole row a single tap target.
+function cardRow(w, title, detail, url, size, first) {
+  if (!first) w.addSpacer(size === "large" ? 10 : 7);
+  const row = w.addStack(); row.layoutVertically();
+  if (url) row.url = url;
+  const t = row.addText(title); t.font = serif(size === "large" ? 15 : 13); t.textColor = ink(); t.lineLimit = 2; t.minimumScaleFactor = 0.85;
+  if (detail) { const d = row.addText(detail); d.font = Font.regularSystemFont(size === "large" ? 11 : 10); d.textColor = muted(); d.lineLimit = 1; d.minimumScaleFactor = 0.85; }
+}
+// When there is nothing to show, he says so in his own words.
+function cardNothing(w, words, size) {
+  const t = w.addText(words); t.font = serif(size === "large" ? 15 : 13); t.textColor = ink(); t.lineLimit = 4; t.minimumScaleFactor = 0.8;
+}
+function openUrl(what) { return "scriptable:///run/" + encodeURIComponent(Script.name()) + "?open=" + what; }
+function howMany(size, large) { return size === "large" ? large : 2; }
+
 async function widget() {
   const size = config.widgetFamily || "medium";
   const w = new ListWidget();
   paintCard(w);
-  w.url = "scriptable:///run/" + encodeURIComponent(Script.name());
+  const which = String(args.widgetParameter || "").trim().toLowerCase();
+  const card = CARDS[which] && which !== "brief" ? which : "brief";
+  w.url = card === "brief" ? "scriptable:///run/" + encodeURIComponent(Script.name()) : openUrl(card);
 
   if (!S.introduced) {
     const t = w.addText("Tap to be introduced.");
@@ -2117,6 +2194,126 @@ async function widget() {
     Script.setWidget(w); return;
   }
 
+  if (card === "diary") return await diaryCard(w, size);
+  if (card === "reminders") return await remindersCard(w, size);
+  if (card === "papers") return papersCard(w, size);
+  if (card === "wireless") return wirelessCard(w, size);
+  if (card === "study") return studyCard(w, size);
+  return await briefCard(w, size);
+}
+
+// The engagements to come: today's that haven't finished, then tomorrow's,
+// then whatever the week holds after that.
+async function diaryCard(w, size) {
+  cardTop(w, `The diary · ${todayWords()}`, size);
+  let list = [], due = [];
+  try {
+    const { today, tom } = await liveFacts();
+    const later = (await eventsWeek()).filter(e => e.startDate > new Date() && !sameDay(e.startDate, new Date()));
+    const seen = new Set();
+    list = leadOrder(today).concat(tom, later).filter(e => { const k = e.title + e.startDate.getTime(); if (seen.has(k)) return false; seen.add(k); return true; });
+    due = (await remindersDue());
+  } catch (e) { fault("The diary", e && e.message || e); }
+  const want = howMany(size, 3);
+  if (!list.length) cardNothing(w, P.diaryEmpty, size);
+  else list.slice(0, want).forEach((e, i) => {
+    // A trip already running says how long it has left, not when it began.
+    const when = e.isAllDay ? (spanWords(e) || "All day") : cap(niceTime(e.startDate));
+    cardRow(w, tidy(e.title), continuing(e) ? cap(when) : `${cap(niceDay(e.startDate))} · ${when}`, openUrl("diary"), size, i === 0);
+  });
+  cardFoot(w, size, false);
+  w.refreshAfterDate = nextRedraw(list.filter(e => sameDay(e.startDate, new Date())), [], due);
+  Script.setWidget(w);
+}
+
+// What requires you, the overdue first, then by the hour they fall due.
+async function remindersCard(w, size) {
+  cardTop(w, "Not to be forgotten", size);
+  let all = [];
+  try { all = await remindersDue(); } catch (e) { fault("The reminders", e && e.message || e); }
+  const lists = listsOf(all);
+  const want = howMany(size, 4);
+  if (!all.length) cardNothing(w, P.remindersEmpty, size);
+  else all.slice(0, want).forEach((r, i) => cardRow(w, tidy(r.title), cap(reminderDetail(r, lists)), openUrl("reminders"), size, i === 0));
+  cardFoot(w, size, false);
+  w.refreshAfterDate = nextRedraw([], [], all);
+  Script.setWidget(w);
+}
+
+// The headlines on the tray, each to its own article. Nothing is fetched;
+// if the tray is bare he says so.
+function papersCard(w, size) {
+  cardTop(w, "The papers", size);
+  const papers = papersUsable(readCache());
+  const items = papers ? papers.top.concat(papers.tagged.filter(t => !papers.top.some(p => p.title === t.title))) : [];
+  const want = howMany(size, 4);
+  const shown = items.slice(0, want);
+  if (!shown.length) cardNothing(w, P.papersEmpty, size);
+  else shown.forEach((i, k) => cardRow(w, i.title, i.paper + (i.tag ? " · flagged " + i.tag : ""), i.link || openUrl("papers"), size, k === 0));
+  // An episode too, if the papers left room and one is new.
+  if (papers && shown.length && shown.length < want && papers.episodes.length) {
+    const e = papers.episodes[0];
+    cardRow(w, e.title, "New from " + e.podcast, e.link || openUrl("wireless"), size, false);
+  }
+  cardFoot(w, size, false);
+  w.refreshAfterDate = new Date(Date.now() + 30 * 60 * 1000);
+  Script.setWidget(w);
+}
+
+// New episodes from the last two days, from the feeds marked as podcasts.
+function wirelessCard(w, size) {
+  cardTop(w, "The wireless", size);
+  const papers = papersUsable(readCache());
+  const eps = papers ? papers.episodes : [];
+  const want = howMany(size, 4);
+  if (!eps.length) cardNothing(w, P.wirelessEmpty, size);
+  else eps.slice(0, want).forEach((e, i) => cardRow(w, e.title, e.podcast + (e.when ? " · " + cap(niceDay(new Date(e.when))) : ""), e.link || openUrl("wireless"), size, i === 0));
+  cardFoot(w, size, false);
+  w.refreshAfterDate = new Date(Date.now() + 30 * 60 * 1000);
+  Script.setWidget(w);
+}
+
+// Your own work, from the files in his records: the week's hours against
+// the cap, and the practice by the numbers. Silent about what it can't read.
+function studyCard(w, size) {
+  cardTop(w, "The study", size);
+  const rows = [];
+  const hw = timesheetWeek();
+  if (hw && hw.entries) {
+    rows.push({ t: `${hw.logged} of ${hw.cap} hours`, d: hw.owing > 0 ? `${hw.owing} owing this week` : hw.logged >= hw.cap ? "The week's cap is used up" : `${Math.round((hw.cap - hw.logged) * 10) / 10} still to log` });
+    const hours = n => `${n} ${n === 1 ? "hour" : "hours"}`;
+    if (hw.sick > 0) rows.push({ t: `${hours(hw.sick)} of sick leave`, d: "This week" });
+    else if (hw.off > 0) rows.push({ t: `${hours(hw.off)} of time off`, d: "This week" });
+  }
+  const tr = trackerFigures();
+  if (tr) {
+    const parts = Object.keys(tr.tally).sort((a, b) => tr.tally[b] - tr.tally[a]).slice(0, 3).map(k => `${tr.tally[k]} ${k}`);
+    rows.push({ t: `${tr.clients} on the books`, d: parts.join(" · ") });
+    if (tr.coaches) rows.push({ t: `${tr.coaches} coaches`, d: "In the practice" });
+  }
+  if (!rows.length) cardNothing(w, P.studyEmpty, size);
+  else rows.slice(0, howMany(size, 4)).forEach((r, i) => cardRow(w, r.t, r.d, openUrl("study"), size, i === 0));
+  cardFoot(w, size, false);
+  w.refreshAfterDate = new Date(Date.now() + 60 * 60 * 1000);
+  Script.setWidget(w);
+}
+// The practice by the numbers, counted from whatever statuses the file uses.
+function trackerFigures() {
+  try {
+    for (const f of fm.listContents(projectsDir)) {
+      const p = fm.joinPath(projectsDir, f);
+      try { fm.downloadFileFromiCloud(p); } catch (e) {}
+      let obj; try { obj = JSON.parse(fm.readString(p)); } catch (e) { continue; }
+      if (!looksLikeAdminTracker(obj)) continue;
+      const cs = obj.clients || [], tally = {};
+      for (const c of cs) { const s = String(c.status || "applicant"); tally[s] = (tally[s] || 0) + 1; }
+      return { clients: cs.length, tally, coaches: (obj.coaches || []).length };
+    }
+  } catch (e) {}
+  return null;
+}
+
+async function briefCard(w, size) {
   const { today, tom, due } = await liveFacts();   // fresh every draw; nothing finished, nothing cached
 
   // The widget fetches nothing. It reads the tray the app has stocked; an
@@ -2181,28 +2378,11 @@ async function widget() {
   delete latest.briefPart; delete latest.headline; delete latest.headlineAt;
   writeCache(latest);
 
-  // ── The card, top to bottom ──
-  // Each line of the top matter is its own row of fixed height, so nothing
-  // can be squeezed onto its neighbour when the paragraph runs long.
-  const line = (h, fill) => { const s = w.addStack(); s.layoutHorizontally(); s.centerAlignContent(); s.size = new Size(0, h); fill(s); s.addSpacer(); return s; };
-  // 1. Header: his name in capitals, then today's date from the device clock. Muted.
-  const now = new Date();
-  const dateWords = `${DAY_NAMES[now.getDay()]} ${now.getDate()} ${MONTH_NAMES[now.getMonth()]}`;
-  line(14, s => { const head = s.addText(size === "small" ? smallCaps(S.valet) : `${smallCaps(S.valet)} · ${smallCaps(dateWords)}`); head.font = Font.mediumSystemFont(11); head.textColor = muted(); head.lineLimit = 1; });
+  // The card: his name and the date, the status strip that belongs to the
+  // brief alone, the rule, then the paragraph.
+  cardTop(w, size === "small" ? S.valet : `${S.valet} · ${todayWords()}`, size, size === "small" ? "" : statusStrip(wx, due, today, tom));
 
-  if (size !== "small") {
-    // 2. Status strip, on its own row beneath: the glanceable layer, figures and short forms.
-    const strip = statusStrip(wx, due, today, tom);
-    if (strip) { w.addSpacer(4); line(14, s => { const st = s.addText(strip); st.font = Font.regularSystemFont(11); st.textColor = muted(); st.lineLimit = 1; st.minimumScaleFactor = 0.85; }); }
-    // 3. A hairline in brass, a quarter strength: a full-width row one point tall.
-    w.addSpacer(8);
-    line(1, s => { s.backgroundColor = brass(0.25); s.cornerRadius = 0.5; });
-    w.addSpacer(10);   // so the paragraph doesn't crowd the rule
-  } else {
-    w.addSpacer(6);
-  }
-
-  // 4. The paragraph, ivory serif. Truncate before shrinking.
+  // The paragraph, ivory serif. Truncate before shrinking.
   const body = w.addText(text);
   body.font = serif(size === "small" ? 13 : size === "large" ? 17 : 15);
   body.textColor = ink();
@@ -2218,22 +2398,9 @@ async function widget() {
     body.lineLimit = 5;
   }
 
-  // 5. Whatever the length, the footer sits at the foot.
-  w.addSpacer();
-
-  // 6. Footer: signature in brass italic, "Looked at" beneath on the large
-  //    card, and the Read-aloud pill on its own tap target.
-  const foot = w.addStack(); foot.layoutHorizontally(); foot.bottomAlignContent();
-  const left = foot.addStack(); left.layoutVertically();
-  const signature = left.addText("— " + S.valet); signature.font = serif(12, true); signature.textColor = brass();
-  if (size === "large") { const looked = left.addText(lookedAt()); looked.font = Font.regularSystemFont(10); looked.textColor = muted(); looked.textOpacity = 0.6; }
-  if (size !== "small") {
-    foot.addSpacer();
-    const pill = foot.addStack();
-    pill.url = "scriptable:///run/" + encodeURIComponent(Script.name()) + "?read=1";   // opens him and he reads this aloud, nothing else
-    pill.setPadding(4, 10, 4, 10); pill.cornerRadius = 11; pill.borderWidth = 1; pill.borderColor = new Color(LOOK.muted, 0.4);
-    const r = pill.addText("Read aloud"); r.font = Font.mediumSystemFont(11); r.textColor = ink();
-  }
+  // The footer sits at the foot whatever the length: signature, the hour he
+  // last looked, and the Read-aloud pill, which is the brief's alone.
+  cardFoot(w, size, true);
 
   w.refreshAfterDate = nextRedraw(today, tom, due);
   Script.setWidget(w);
@@ -2253,6 +2420,14 @@ try {
     // Run by an automation with the word "refresh": stock the tray, papers
     // and weather, and leave without a word. The widget reads it next time.
     await refreshTray();
+  } else if (args.queryParameters && args.queryParameters.open) {
+    // A card was tapped: open the room it belongs to, and nothing else.
+    const which = String(args.queryParameters.open);
+    refreshTray();
+    if (which === "diary") await diaryTable();
+    else if (which === "reminders") await remindersTable();
+    else if (which === "papers") await papers(false);
+    else await openDuty(DUTIES.find(d => d.id === which) || DUTIES.find(d => d.id === "study"));
   } else if (args.queryParameters && args.queryParameters.read) {
     // Tapped "Read aloud" on the widget: say the brief and withdraw. His
     // written paragraph only if it is recent and still true; otherwise a
